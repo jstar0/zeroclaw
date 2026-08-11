@@ -462,11 +462,23 @@ pub(crate) fn build_approve_deny_approval_prompt(
     )
 }
 
+#[cfg(any(
+    feature = "channel-matrix",
+    feature = "channel-slack",
+    feature = "channel-telegram",
+    test
+))]
 pub(crate) struct PendingApproval {
     pub(crate) sender: tokio::sync::oneshot::Sender<zeroclaw_api::channel::ChannelApprovalResponse>,
     pub(crate) destination: String,
 }
 
+#[cfg(any(
+    feature = "channel-matrix",
+    feature = "channel-slack",
+    feature = "channel-telegram",
+    test
+))]
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum PendingApprovalResolution {
     NotFound,
@@ -475,12 +487,24 @@ pub(crate) enum PendingApprovalResolution {
     ReceiverClosed,
 }
 
+#[cfg(any(
+    feature = "channel-matrix",
+    feature = "channel-slack",
+    feature = "channel-telegram",
+    test
+))]
 impl PendingApprovalResolution {
     pub(crate) fn suppresses_message(self) -> bool {
         !matches!(self, Self::NotFound)
     }
 }
 
+#[cfg(any(
+    feature = "channel-matrix",
+    feature = "channel-slack",
+    feature = "channel-telegram",
+    test
+))]
 pub(crate) async fn resolve_pending_approval(
     pending_approvals: &tokio::sync::Mutex<std::collections::HashMap<String, PendingApproval>>,
     token: &str,
