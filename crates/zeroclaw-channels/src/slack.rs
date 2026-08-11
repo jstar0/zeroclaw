@@ -3912,6 +3912,35 @@ impl SlackChannel {
         ))
     }
 
+    async fn handle_socket_mode_interactive(
+        &self,
+        envelope: &serde_json::Value,
+        tx: &tokio::sync::mpsc::Sender<ChannelMessage>,
+        bot_user_id: &str,
+    ) -> bool {
+        if let Some((token, response, responder, channel)) =
+            Self::try_parse_approval_block_action(envelope)
+        {
+            crate::util::resolve_pending_approval(
+                &self.pending_approvals,
+                &token,
+                response,
+                self.is_user_allowed(&responder),
+                &channel,
+            )
+            .await;
+            return true;
+        }
+
+        if let Some(msg) = Self::parse_block_action_as_command(envelope, bot_user_id, &self.alias)
+            && tx.send(msg).await.is_err()
+        {
+            return false;
+        }
+
+        true
+    }
+
     /// Parse a Socket Mode `interactive` envelope containing a `block_actions`
     /// payload from the `/config` Block Kit UI.  Translates model_provider/model
     /// dropdown selections into synthetic `/models <model_provider>` or `/model <id>`
@@ -4218,22 +4247,9 @@ impl SlackChannel {
 
                 // Handle interactive payloads (block_actions from /config UI or approval buttons).
                 if envelope_type == "interactive" {
-                    if let Some((token, response, responder, channel)) =
-                        Self::try_parse_approval_block_action(&envelope)
-                    {
-                        crate::util::resolve_pending_approval(
-                            &self.pending_approvals,
-                            &token,
-                            response,
-                            self.is_user_allowed(&responder),
-                            &channel,
-                        )
-                        .await;
-                        continue;
-                    }
-                    if let Some(msg) =
-                        Self::parse_block_action_as_command(&envelope, bot_user_id, &self.alias)
-                        && tx.send(msg).await.is_err()
+                    if !self
+                        .handle_socket_mode_interactive(&envelope, &tx, bot_user_id)
+                        .await
                     {
                         return Ok(());
                     }
@@ -8972,6 +8988,98 @@ mod tests {
                 .any(|request| request.url.path() == "/conversations.history"),
             "test must drive the production polling ingress"
         );
+    }
+
+    #[tokio::test]
+    async fn socket_mode_interactive_ingress_suppresses_rejected_approval_replies() {
+        use zeroclaw_api::channel::ChannelApprovalResponse;
+
+        let channel = SlackChannel::new(
+            "xoxb-token".into(),
+            None,
+            vec![],
+            "slack_test_alias",
+            Arc::new(|| vec!["U_OPERATOR".into()]),
+        );
+        let pending = Arc::clone(&channel.pending_approvals);
+        let (approved_tx, approved_rx) = oneshot::channel();
+        let (wrong_tx, _wrong_rx) = oneshot::channel();
+        let (unauthorized_tx, _unauthorized_rx) = oneshot::channel();
+        {
+            let mut approvals = pending.lock().await;
+            approvals.insert(
+                "auth01".into(),
+                crate::util::PendingApproval {
+                    sender: approved_tx,
+                    destination: "C_ORIGIN".into(),
+                },
+            );
+            approvals.insert(
+                "wrong1".into(),
+                crate::util::PendingApproval {
+                    sender: wrong_tx,
+                    destination: "C_ORIGIN".into(),
+                },
+            );
+            approvals.insert(
+                "other1".into(),
+                crate::util::PendingApproval {
+                    sender: unauthorized_tx,
+                    destination: "C_ORIGIN".into(),
+                },
+            );
+        }
+
+        let (tx, mut inbound_rx) = tokio::sync::mpsc::channel(4);
+        let envelopes = [
+            serde_json::json!({
+                "type": "interactive",
+                "payload": {
+                    "type": "block_actions",
+                    "user": { "id": "U_OTHER" },
+                    "channel": { "id": "C_ORIGIN" },
+                    "actions": [{ "action_id": "approval_other1_deny" }]
+                }
+            }),
+            serde_json::json!({
+                "type": "interactive",
+                "payload": {
+                    "type": "block_actions",
+                    "user": { "id": "U_OPERATOR" },
+                    "channel": { "id": "C_OTHER" },
+                    "actions": [{ "action_id": "approval_wrong1_deny" }]
+                }
+            }),
+            serde_json::json!({
+                "type": "interactive",
+                "payload": {
+                    "type": "block_actions",
+                    "user": { "id": "U_OPERATOR" },
+                    "channel": { "id": "C_ORIGIN" },
+                    "actions": [{ "action_id": "approval_auth01_approve" }]
+                }
+            }),
+        ];
+
+        for envelope in &envelopes {
+            assert!(
+                channel
+                    .handle_socket_mode_interactive(envelope, &tx, "U_BOT")
+                    .await,
+                "the live Socket Mode loop must continue after each interactive payload"
+            );
+        }
+
+        assert_eq!(approved_rx.await.unwrap(), ChannelApprovalResponse::Approve);
+        assert!(
+            tokio::time::timeout(Duration::from_millis(50), inbound_rx.recv())
+                .await
+                .is_err(),
+            "approval-shaped Socket Mode payloads must not reach agent dispatch"
+        );
+        let approvals = pending.lock().await;
+        assert!(approvals.contains_key("wrong1"));
+        assert!(approvals.contains_key("other1"));
     }
 
     #[test]
