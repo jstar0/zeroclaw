@@ -494,6 +494,7 @@ pub(crate) enum PendingApprovalResolution {
     test
 ))]
 impl PendingApprovalResolution {
+    #[cfg(any(feature = "channel-matrix", feature = "channel-slack", test))]
     pub(crate) fn suppresses_message(self) -> bool {
         !matches!(self, Self::NotFound)
     }
