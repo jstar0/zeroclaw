@@ -172,6 +172,23 @@ mod mention {
         }
         false
     }
+
+    /// Group `mention_only` admits either an explicit mention or a direct reply
+    /// to a bot message (Telegram parity: replies are unambiguous intent).
+    pub(super) fn admit_group_message(is_mentioned: bool, is_reply_to_bot: bool) -> bool {
+        is_mentioned || is_reply_to_bot
+    }
+
+    /// True when a Matrix event JSON `sender` equals `user_id`.
+    /// Production admission uses `TimelineEvent::sender()`; this helper remains
+    /// for focused unit coverage of the JSON sender comparison.
+    #[cfg(test)]
+    pub(super) fn sender_is_user(raw_json: &str, user_id: &UserId) -> bool {
+        let Ok(v) = serde_json::from_str::<serde_json::Value>(raw_json) else {
+            return false;
+        };
+        v.get("sender").and_then(|s| s.as_str()) == Some(user_id.as_str())
+    }
 }
 
 // ─── allowlist ─────────────────────────────────────────────────────────────
@@ -1435,11 +1452,14 @@ mod inbound {
         },
     };
     use serde_json::Value as JsonValue;
-    use tokio::sync::{Mutex as TokioMutex, RwLock as TokioRwLock, mpsc};
+    use tokio::sync::{Mutex as TokioMutex, RwLock as TokioRwLock, mpsc, oneshot};
 
     use super::{allowlist, approval, context as ctx_mod, mention};
     use crate::transcription::TranscriptionManager;
-    use zeroclaw_api::{channel::ChannelMessage, media::MediaAttachment};
+    use zeroclaw_api::{
+        channel::{ChannelApprovalResponse, ChannelMessage},
+        media::MediaAttachment,
+    };
     use zeroclaw_config::schema::{MatrixConfig, TranscriptionConfig};
 
     pub(super) const SYNC_LONGPOLL_TIMEOUT: Duration = Duration::from_secs(30);
@@ -1456,7 +1476,8 @@ mod inbound {
         pub transcription: Option<Arc<TranscriptionConfig>>,
         pub workspace_dir: Option<Arc<std::path::PathBuf>>,
         pub tx: mpsc::Sender<ChannelMessage>,
-        pub pending_approvals: Arc<TokioMutex<HashMap<String, crate::util::PendingApproval>>>,
+        pub pending_approvals:
+            Arc<TokioMutex<HashMap<String, oneshot::Sender<ChannelApprovalResponse>>>>,
         pub threads_seen: Arc<TokioRwLock<HashSet<OwnedEventId>>>,
         pub bot_user_id: OwnedUserId,
         pub bot_display_name: Arc<TokioRwLock<Option<String>>>,
@@ -1614,25 +1635,19 @@ mod inbound {
         let body = ctx_mod::body_for(&ev.content.msgtype);
         let sender = ev.sender.as_str();
         let room_id = room.room_id().as_str();
-        let allowed_peers = (ctx.peer_resolver)();
-        let sender_allowed = allowlist::user_allowed(&allowed_peers, sender);
-        let room_allowed = allowlist::room_allowed_static(&ctx.config.allowed_rooms, room_id);
 
-        if let Some((token, response)) = approval::parse_reply(&body)
-            && crate::util::resolve_pending_approval(
-                &ctx.pending_approvals,
-                &token,
-                response,
-                sender_allowed && room_allowed,
-                room_id,
-            )
-            .await
-            .suppresses_message()
-        {
-            return Ok(());
+        // Approval reply has highest priority — operator answer must work even
+        // if the room/user filters would otherwise drop the message.
+        if let Some((token, response)) = approval::parse_reply(&body) {
+            let waiter = ctx.pending_approvals.lock().await.remove(&token);
+            if let Some(tx) = waiter {
+                let _ = tx.send(response);
+                return Ok(());
+            }
         }
 
-        if !sender_allowed {
+        let allowed_peers = (ctx.peer_resolver)();
+        if !allowlist::user_allowed(&allowed_peers, sender) {
             ::zeroclaw_log::record!(
                 DEBUG,
                 ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
@@ -1641,7 +1656,7 @@ mod inbound {
             );
             return Ok(());
         }
-        if !room_allowed {
+        if !allowlist::room_allowed_static(&ctx.config.allowed_rooms, room_id) {
             ::zeroclaw_log::record!(
                 DEBUG,
                 ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
@@ -1651,15 +1666,54 @@ mod inbound {
             return Ok(());
         }
 
+        // Fetch the reply parent at most once for the mention_only gate and
+        // the parent-media path below (Room::event always hits the homeserver).
+        let reply_target = extract_in_reply_to(&raw);
+        let mut cached_reply_parent = None;
+
         if ctx.config.mention_only && is_group_room(&room).await {
             let display_name = ctx.bot_display_name.read().await.clone();
             let mention_user_ids = extract_mentions_user_ids(&raw);
-            if !mention::is_mentioned(
+            let mentioned = mention::is_mentioned(
                 &ctx.bot_user_id,
                 display_name.as_deref(),
                 mention_user_ids.as_deref(),
                 &body,
-            ) {
+            );
+            // Reply-to-bot bypasses the mention gate (Telegram parity). Fetch the
+            // parent only when the body/mention list alone would drop the turn.
+            let reply_to_bot = if mentioned {
+                false
+            } else if let Some(reply_id) = reply_target.as_ref() {
+                match room.event(reply_id, None).await {
+                    Ok(timeline_event) => {
+                        let is_bot = timeline_event
+                            .sender()
+                            .as_ref()
+                            .is_some_and(|sender| sender == &ctx.bot_user_id);
+                        cached_reply_parent = Some(timeline_event);
+                        is_bot
+                    }
+                    Err(e) => {
+                        ::zeroclaw_log::record!(
+                            DEBUG,
+                            ::zeroclaw_log::Event::new(
+                                module_path!(),
+                                ::zeroclaw_log::Action::Note
+                            )
+                            .with_attrs(::serde_json::json!({
+                                "error": format!("{e}"),
+                                "reply_id": reply_id,
+                            })),
+                            "matrix: failed to fetch reply parent for mention_only gate"
+                        );
+                        false
+                    }
+                }
+            } else {
+                false
+            };
+            if !mention::admit_group_message(mentioned, reply_to_bot) {
                 ::zeroclaw_log::record!(
                     DEBUG,
                     ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
@@ -1744,10 +1798,15 @@ mod inbound {
                 ctx.transcription.as_deref(),
             )
             .await;
-        } else if let Some(reply_target) = extract_in_reply_to(&raw) {
-            match room.event(&reply_target, None).await {
+        } else if let Some(reply_id) = reply_target.as_ref() {
+            let parent = if let Some(cached) = cached_reply_parent.take() {
+                Ok(cached)
+            } else {
+                room.event(reply_id, None).await
+            };
+            match parent {
                 Ok(timeline_event) => {
-                    if let Some(info) = parent_media_info(timeline_event.into_raw()) {
+                    if let Some(info) = parent_media_info(timeline_event.raw().clone()) {
                         content = attach_media(
                             &room,
                             &info,
@@ -1760,7 +1819,7 @@ mod inbound {
                     }
                 }
                 Err(e) => {
-                    ::zeroclaw_log::record!(DEBUG, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note).with_attrs(::serde_json::json!({"error": format!("{}", e), "reply_target": reply_target})), "matrix: could not fetch in_reply_to parent")
+                    ::zeroclaw_log::record!(DEBUG, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note).with_attrs(::serde_json::json!({"error": format!("{}", e), "reply_target": reply_id})), "matrix: could not fetch in_reply_to parent")
                 }
             }
         }
@@ -3213,7 +3272,7 @@ pub struct MatrixChannel {
     workspace_dir: Option<Arc<PathBuf>>,
     transcription: Option<Arc<TranscriptionConfig>>,
     client: tokio::sync::OnceCell<Client>,
-    pending_approvals: Arc<TokioMutex<HashMap<String, crate::util::PendingApproval>>>,
+    pending_approvals: Arc<TokioMutex<HashMap<String, oneshot::Sender<ChannelApprovalResponse>>>>,
     streaming_state: Arc<TokioRwLock<streaming::State>>,
     threads_seen: Arc<TokioRwLock<HashSet<OwnedEventId>>>,
     alias_cache: Arc<TokioRwLock<HashMap<String, OwnedRoomId>>>,
@@ -3812,10 +3871,6 @@ impl Channel for MatrixChannel {
         recipient: &str,
         request: &ChannelApprovalRequest,
     ) -> Result<Option<zeroclaw_api::channel::AttributedApprovalResponse>> {
-        let client = self.ensure_client().await?;
-        let destination = client::resolve_room(client, &self.alias_cache, recipient)
-            .await?
-            .to_string();
         let token = approval::generate_token_default();
         let prompt = crate::util::build_approve_deny_approval_prompt(
             &token,
@@ -3824,13 +3879,10 @@ impl Channel for MatrixChannel {
         );
 
         let (tx, rx) = oneshot::channel();
-        self.pending_approvals.lock().await.insert(
-            token.clone(),
-            crate::util::PendingApproval {
-                sender: tx,
-                destination,
-            },
-        );
+        self.pending_approvals
+            .lock()
+            .await
+            .insert(token.clone(), tx);
 
         let send_msg = SendMessage::new(prompt, recipient);
         if let Err(e) = self.send(&send_msg).await {
@@ -4206,10 +4258,9 @@ mod tests {
         use matrix_sdk::ruma::{RoomId, room_id, user_id};
         use matrix_sdk::test_utils::mocks::MatrixMockServer;
         use matrix_sdk_test::JoinedRoomBuilder;
-        use tokio::sync::{Mutex as TokioMutex, RwLock as TokioRwLock, mpsc, oneshot};
+        use tokio::sync::{Mutex as TokioMutex, RwLock as TokioRwLock, mpsc};
         use wiremock::matchers::{method, path, path_regex};
         use wiremock::{Mock, ResponseTemplate};
-        use zeroclaw_api::channel::ChannelApprovalResponse;
         use zeroclaw_config::schema::{MatrixConfig, TranscriptionConfig};
 
         use super::super::inbound::{HandlerCtx, register_event_handlers};
@@ -4570,106 +4621,191 @@ mod tests {
             assert_stt_received_the_wav(&stt.received_requests().await.unwrap(), &wav);
         }
 
+        fn mention_only_handler_ctx(
+            tx: mpsc::Sender<zeroclaw_api::channel::ChannelMessage>,
+        ) -> HandlerCtx {
+            let mut ctx = handler_ctx(
+                "http://127.0.0.1:9/v1/transcribe",
+                std::path::Path::new("/tmp"),
+                tx,
+            );
+            // Clone config Arc contents with mention_only enabled.
+            let mut config = (*ctx.config).clone();
+            config.mention_only = true;
+            ctx.config = Arc::new(config);
+            ctx.transcription = None;
+            ctx.workspace_dir = None;
+            ctx
+        }
+
+        fn text_parent_event(event_id: &str, sender: &str, body: &str) -> serde_json::Value {
+            serde_json::json!({
+                "type": "m.room.message",
+                "event_id": event_id,
+                "sender": sender,
+                "origin_server_ts": 1_000_000u64,
+                "content": {
+                    "msgtype": "m.text",
+                    "body": body
+                }
+            })
+        }
+
+        fn plain_reply_event(event_id: &str, parent_id: &str, body: &str) -> serde_json::Value {
+            serde_json::json!({
+                "type": "m.room.message",
+                "event_id": event_id,
+                "sender": "@alice:localhost",
+                "origin_server_ts": 1_000_001u64,
+                "content": {
+                    "msgtype": "m.text",
+                    "body": body,
+                    "m.relates_to": {
+                        "m.in_reply_to": { "event_id": parent_id }
+                    }
+                }
+            })
+        }
+
+        async fn mount_parent_event(
+            matrix: &MatrixMockServer,
+            parent: serde_json::Value,
+            expected_gets: u64,
+        ) {
+            let parent_id = parent["event_id"]
+                .as_str()
+                .expect("parent event_id")
+                .to_string();
+            // Event ids in these tests are `$name:localhost` — escape `$` for the regex.
+            let pattern = format!(
+                r"^/_matrix/client/v3/rooms/.*/event/{}$",
+                parent_id.replace('$', r"\$")
+            );
+            Mock::given(method("GET"))
+                .and(path_regex(pattern))
+                .respond_with(ResponseTemplate::new(200).set_body_json(parent))
+                .expect(expected_gets)
+                .mount(matrix.server())
+                .await;
+        }
+
         #[tokio::test]
-        async fn sync_ingress_suppresses_rejected_approval_replies_and_delivers_authorized_one() {
+        async fn mention_only_forwards_unmentioned_reply_to_bot_with_one_parent_fetch() {
             let matrix = MatrixMockServer::new().await;
             let client = matrix.client_builder().build().await;
             matrix.sync_joined_room(&client, test_room()).await;
 
-            let (tx, mut inbound_rx) = mpsc::channel(4);
-            let ctx = HandlerCtx {
-                config: Arc::new(MatrixConfig {
-                    allowed_rooms: vec![test_room().to_string()],
-                    ..MatrixConfig::default()
-                }),
-                alias: "test".to_string(),
-                peer_resolver: Arc::new(|| vec!["@operator:localhost".to_string()]),
-                transcription: None,
-                workspace_dir: None,
-                tx,
-                pending_approvals: Arc::new(TokioMutex::new(HashMap::new())),
-                threads_seen: Arc::new(TokioRwLock::new(HashSet::new())),
-                bot_user_id: user_id!("@bot:localhost").to_owned(),
-                bot_display_name: Arc::new(TokioRwLock::new(None)),
-                initial_sync_done: Arc::new(AtomicBool::new(true)),
-                undecryptable_seen: Arc::new(TokioMutex::new(HashSet::new())),
-            };
-            let (approved_tx, approved_rx) = oneshot::channel();
-            let (wrong_tx, _wrong_rx) = oneshot::channel();
-            let (unauthorized_tx, _unauthorized_rx) = oneshot::channel();
-            {
-                let mut approvals = ctx.pending_approvals.lock().await;
-                approvals.insert(
-                    "AUTH0001".into(),
-                    crate::util::PendingApproval {
-                        sender: approved_tx,
-                        destination: test_room().to_string(),
-                    },
-                );
-                approvals.insert(
-                    "WRONG001".into(),
-                    crate::util::PendingApproval {
-                        sender: wrong_tx,
-                        destination: "!other:localhost".into(),
-                    },
-                );
-                approvals.insert(
-                    "OTHER001".into(),
-                    crate::util::PendingApproval {
-                        sender: unauthorized_tx,
-                        destination: test_room().to_string(),
-                    },
-                );
-            }
+            let parent = text_parent_event("$botparent:localhost", "@bot:localhost", "bot said hi");
+            mount_parent_event(&matrix, parent, 1).await;
 
+            let (tx, mut rx) = mpsc::channel(4);
+            let ctx = mention_only_handler_ctx(tx);
             let _guards = register_event_handlers(&client, &ctx);
-            let approved = serde_json::json!({
-                "type": "m.room.message",
-                "event_id": "$approved:localhost",
-                "sender": "@operator:localhost",
-                "origin_server_ts": 1_000_000u64,
-                "content": { "msgtype": "m.text", "body": "AUTH0001 approve" }
-            });
-            let wrong_destination = serde_json::json!({
-                "type": "m.room.message",
-                "event_id": "$wrong-destination:localhost",
-                "sender": "@operator:localhost",
-                "origin_server_ts": 1_000_001u64,
-                "content": { "msgtype": "m.text", "body": "WRONG001 deny" }
-            });
-            let unauthorized = serde_json::json!({
-                "type": "m.room.message",
-                "event_id": "$unauthorized:localhost",
-                "sender": "@other:localhost",
-                "origin_server_ts": 1_000_002u64,
-                "content": { "msgtype": "m.text", "body": "OTHER001 deny" }
-            });
+
+            let json = plain_reply_event(
+                "$reply-bot:localhost",
+                "$botparent:localhost",
+                "thanks, continuing without an @mention",
+            );
             matrix
                 .sync_room(
                     &client,
-                    JoinedRoomBuilder::new(test_room())
-                        .add_timeline_event(timeline_raw(&approved))
-                        .add_timeline_event(timeline_raw(&wrong_destination))
-                        .add_timeline_event(timeline_raw(&unauthorized)),
+                    JoinedRoomBuilder::new(test_room()).add_timeline_event(timeline_raw(&json)),
                 )
                 .await;
 
+            let msg = recv_forwarded(&mut rx).await;
             assert_eq!(
-                tokio::time::timeout(Duration::from_secs(5), approved_rx)
-                    .await
-                    .expect("sync ingress should resolve the authorized approval")
-                    .expect("sync ingress should resolve the authorized approval"),
-                ChannelApprovalResponse::Approve
+                msg.content, "thanks, continuing without an @mention",
+                "unmentioned reply-to-bot must be forwarded under mention_only"
             );
+        }
+
+        #[tokio::test]
+        async fn mention_only_drops_unmentioned_reply_to_non_bot_parent() {
+            let matrix = MatrixMockServer::new().await;
+            let client = matrix.client_builder().build().await;
+            matrix.sync_joined_room(&client, test_room()).await;
+
+            let parent = text_parent_event(
+                "$aliceparent:localhost",
+                "@carol:localhost",
+                "human chatter",
+            );
+            mount_parent_event(&matrix, parent, 1).await;
+
+            let (tx, mut rx) = mpsc::channel(4);
+            let ctx = mention_only_handler_ctx(tx);
+            let _guards = register_event_handlers(&client, &ctx);
+
+            let json = plain_reply_event(
+                "$reply-human:localhost",
+                "$aliceparent:localhost",
+                "replying to carol, not the bot",
+            );
+            matrix
+                .sync_room(
+                    &client,
+                    JoinedRoomBuilder::new(test_room()).add_timeline_event(timeline_raw(&json)),
+                )
+                .await;
+
+            let timed_out = tokio::time::timeout(Duration::from_millis(500), rx.recv())
+                .await
+                .is_err();
             assert!(
-                tokio::time::timeout(Duration::from_millis(200), inbound_rx.recv())
-                    .await
-                    .is_err(),
-                "approval-shaped events must not reach agent dispatch"
+                timed_out,
+                "unmentioned reply to a non-bot parent must be dropped"
             );
-            let approvals = ctx.pending_approvals.lock().await;
-            assert!(approvals.contains_key("WRONG001"));
-            assert!(approvals.contains_key("OTHER001"));
+        }
+
+        #[tokio::test]
+        async fn mention_only_reply_to_bot_voice_reuses_single_parent_fetch() {
+            let wav = build_wav();
+
+            let matrix = MatrixMockServer::new().await;
+            let client = matrix.client_builder().build().await;
+            matrix.sync_joined_room(&client, test_room()).await;
+            mount_media_download(&matrix, &wav).await;
+
+            // Parent is a bot voice note: gate + parent-media must share one GET.
+            let mut parent = voice_event_json("$botvoice:localhost");
+            parent["sender"] = serde_json::json!("@bot:localhost");
+            mount_parent_event(&matrix, parent, 1).await;
+
+            let stt = stt_server().await;
+            let workspace = tempfile::tempdir().unwrap();
+            let (tx, mut rx) = mpsc::channel(4);
+            let mut ctx = handler_ctx(
+                &format!("{}/v1/transcribe", stt.uri()),
+                workspace.path(),
+                tx,
+            );
+            let mut config = (*ctx.config).clone();
+            config.mention_only = true;
+            ctx.config = Arc::new(config);
+
+            let _guards = register_event_handlers(&client, &ctx);
+            let json = plain_reply_event(
+                "$reply-voice:localhost",
+                "$botvoice:localhost",
+                "what did you say?",
+            );
+            matrix
+                .sync_room(
+                    &client,
+                    JoinedRoomBuilder::new(test_room()).add_timeline_event(timeline_raw(&json)),
+                )
+                .await;
+
+            let msg = recv_forwarded(&mut rx).await;
+            assert!(
+                msg.content
+                    .contains(&format!("[voice transcript]: {TRANSCRIPT}")),
+                "admitted reply must still attach parent media once: {}",
+                msg.content
+            );
+            assert_stt_received_the_wav(&stt.received_requests().await.unwrap(), &wav);
         }
     }
 
@@ -4754,97 +4890,6 @@ mod tests {
         use rand::rngs::StdRng;
         use std::collections::HashSet;
         use zeroclaw_api::channel::ChannelApprovalResponse;
-
-        #[tokio::test]
-        async fn pending_approval_requires_allowed_user_and_origin_room() {
-            let pending = tokio::sync::Mutex::new(std::collections::HashMap::new());
-            let (tx, rx) = tokio::sync::oneshot::channel();
-            pending.lock().await.insert(
-                "APPROVAL".to_string(),
-                crate::util::PendingApproval {
-                    sender: tx,
-                    destination: "!origin:example.invalid".to_string(),
-                },
-            );
-
-            for response in [
-                ChannelApprovalResponse::Approve,
-                ChannelApprovalResponse::Deny,
-                ChannelApprovalResponse::AlwaysApprove,
-            ] {
-                assert_eq!(
-                    crate::util::resolve_pending_approval(
-                        &pending,
-                        "APPROVAL",
-                        response,
-                        super::super::allowlist::user_allowed(
-                            &["@operator:example.invalid".to_string()],
-                            "@other:example.invalid",
-                        ),
-                        "!origin:example.invalid",
-                    )
-                    .await,
-                    crate::util::PendingApprovalResolution::Rejected,
-                );
-                assert!(pending.lock().await.contains_key("APPROVAL"));
-            }
-
-            assert_eq!(
-                crate::util::resolve_pending_approval(
-                    &pending,
-                    "APPROVAL",
-                    ChannelApprovalResponse::Approve,
-                    super::super::allowlist::user_allowed(
-                        &["@operator:example.invalid".to_string()],
-                        "@operator:example.invalid",
-                    ),
-                    "!other:example.invalid",
-                )
-                .await,
-                crate::util::PendingApprovalResolution::Rejected,
-            );
-            assert!(pending.lock().await.contains_key("APPROVAL"));
-
-            assert_eq!(
-                crate::util::resolve_pending_approval(
-                    &pending,
-                    "APPROVAL",
-                    ChannelApprovalResponse::AlwaysApprove,
-                    super::super::allowlist::user_allowed(
-                        &["@operator:example.invalid".to_string()],
-                        "@operator:example.invalid",
-                    ),
-                    "!origin:example.invalid",
-                )
-                .await,
-                crate::util::PendingApprovalResolution::Resolved,
-            );
-            assert_eq!(rx.await.unwrap(), ChannelApprovalResponse::AlwaysApprove);
-
-            let (approve_tx, approve_rx) = tokio::sync::oneshot::channel();
-            pending.lock().await.insert(
-                "APPROVE2".to_string(),
-                crate::util::PendingApproval {
-                    sender: approve_tx,
-                    destination: "!origin:example.invalid".to_string(),
-                },
-            );
-            assert_eq!(
-                crate::util::resolve_pending_approval(
-                    &pending,
-                    "APPROVE2",
-                    ChannelApprovalResponse::Approve,
-                    super::super::allowlist::user_allowed(
-                        &["@operator:example.invalid".to_string()],
-                        "@operator:example.invalid",
-                    ),
-                    "!origin:example.invalid",
-                )
-                .await,
-                crate::util::PendingApprovalResolution::Resolved,
-            );
-            assert_eq!(approve_rx.await.unwrap(), ChannelApprovalResponse::Approve);
-        }
 
         #[test]
         fn token_length_and_alphabet() {
@@ -5011,7 +5056,7 @@ mod tests {
     }
 
     mod mention {
-        use super::super::mention::is_mentioned;
+        use super::super::mention::{admit_group_message, is_mentioned, sender_is_user};
         use matrix_sdk::ruma::user_id;
 
         #[test]
@@ -5063,6 +5108,25 @@ mod tests {
                 None,
                 "no mention here"
             ));
+        }
+
+        #[test]
+        fn admit_group_message_allows_reply_to_bot_without_mention() {
+            assert!(admit_group_message(false, true));
+            assert!(admit_group_message(true, false));
+            assert!(admit_group_message(true, true));
+            assert!(!admit_group_message(false, false));
+        }
+
+        #[test]
+        fn sender_is_user_matches_bot_parent_event() {
+            let bot = user_id!("@bot:example.org");
+            let parent =
+                r#"{"sender":"@bot:example.org","type":"m.room.message","content":{"body":"hi"}}"#;
+            let other = r#"{"sender":"@alice:example.org","type":"m.room.message","content":{"body":"hi"}}"#;
+            assert!(sender_is_user(parent, bot));
+            assert!(!sender_is_user(other, bot));
+            assert!(!sender_is_user("not-json", bot));
         }
     }
 
