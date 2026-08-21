@@ -6210,7 +6210,7 @@ mod tests {
             let iv = [0x42; 16];
             let mut ciphertext = vec![0; plaintext.len() + 16];
             ciphertext[..plaintext.len()].copy_from_slice(plaintext);
-            let ciphertext = cbc::Encryptor::<Aes256>::new((&key).into(), (&iv).into())
+            let ciphertext = cbc::Encryptor::<Aes256>::new(&key, (&iv).into())
                 .encrypt_padded_mut::<Pkcs7>(&mut ciphertext, plaintext.len())
                 .unwrap();
             let mut encrypted = iv.to_vec();
