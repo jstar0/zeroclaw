@@ -3,7 +3,7 @@ use base64::Engine as _;
 use futures_util::{SinkExt, StreamExt};
 use prost::Message as ProstMessage;
 use reqwest::multipart::{Form, Part};
-use sha2::{Digest, Sha256};
+use sha1::{Digest, Sha1};
 use std::borrow::Cow;
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -771,46 +771,53 @@ pub struct LarkChannel {
 #[derive(Clone)]
 struct LarkWebhookState {
     verification_token: String,
-    encrypt_key: Option<String>,
     channel: Arc<LarkChannel>,
     tx: tokio::sync::mpsc::Sender<ChannelMessage>,
 }
 
 fn verify_lark_webhook_request(
     verification_token: &str,
-    encrypt_key: Option<&str>,
     headers: &axum::http::HeaderMap,
     body: &[u8],
     payload: &serde_json::Value,
 ) -> bool {
-    if let Some(encrypt_key) = encrypt_key.filter(|key| !key.is_empty()) {
-        let timestamp = headers
-            .get("x-lark-request-timestamp")
-            .and_then(|value| value.to_str().ok())
-            .filter(|value| !value.is_empty());
-        let nonce = headers
-            .get("x-lark-request-nonce")
-            .and_then(|value| value.to_str().ok())
-            .filter(|value| !value.is_empty());
-        let signature = headers
-            .get("x-lark-signature")
-            .and_then(|value| value.to_str().ok())
-            .map(str::trim)
-            .filter(|value| !value.is_empty());
+    let timestamp = headers
+        .get("x-lark-request-timestamp")
+        .and_then(|value| value.to_str().ok())
+        .filter(|value| !value.is_empty());
+    let nonce = headers
+        .get("x-lark-request-nonce")
+        .and_then(|value| value.to_str().ok())
+        .filter(|value| !value.is_empty());
+    let signature = headers
+        .get("x-lark-signature")
+        .and_then(|value| value.to_str().ok())
+        .map(str::trim)
+        .filter(|value| !value.is_empty());
 
-        let (Some(timestamp), Some(nonce), Some(signature)) = (timestamp, nonce, signature) else {
+    if let (Some(timestamp), Some(nonce), Some(signature)) = (timestamp, nonce, signature) {
+        if verification_token.is_empty() {
             return false;
-        };
+        }
 
-        let mut digest = Sha256::new();
+        let mut digest = Sha1::new();
         digest.update(timestamp.as_bytes());
         digest.update(nonce.as_bytes());
-        digest.update(encrypt_key.as_bytes());
+        digest.update(verification_token.as_bytes());
         digest.update(body);
         let expected = hex::encode(digest.finalize());
         return expected.eq_ignore_ascii_case(signature);
     }
 
+    // URL verification is the one callback sent before signature headers are
+    // available. Ordinary callbacks must use the signed contract above.
+    if payload
+        .get("challenge")
+        .and_then(|value| value.as_str())
+        .is_none()
+    {
+        return false;
+    }
     let token = payload
         .pointer("/header/token")
         .or_else(|| payload.get("token"))
@@ -840,13 +847,7 @@ async fn handle_lark_webhook_event(
         }
     };
 
-    if !verify_lark_webhook_request(
-        &state.verification_token,
-        state.encrypt_key.as_deref(),
-        &headers,
-        &body,
-        &payload,
-    ) {
+    if !verify_lark_webhook_request(&state.verification_token, &headers, &body, &payload) {
         ::zeroclaw_log::record!(
             WARN,
             ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Reject)
@@ -3738,7 +3739,6 @@ impl LarkChannel {
 
         let state = LarkWebhookState {
             verification_token: self.verification_token.clone(),
-            encrypt_key: self.encrypt_key.clone(),
             channel: Arc::new(self.clone()),
             tx,
         };
@@ -4131,24 +4131,60 @@ mod tests {
     }
 
     #[test]
-    fn webhook_without_encrypt_key_requires_matching_verification_token() {
+    fn webhook_challenge_requires_matching_verification_token() {
         let payload = serde_json::json!({
+            "challenge": "challenge-value",
             "header": { "token": "verification-token" }
         });
         let headers = axum::http::HeaderMap::new();
 
         assert!(verify_lark_webhook_request(
             "verification-token",
-            None,
             &headers,
-            br#"{"header":{"token":"verification-token"}}"#,
+            br#"{"challenge":"challenge-value","header":{"token":"verification-token"}}"#,
             &payload,
         ));
         assert!(!verify_lark_webhook_request(
             "different-token",
-            None,
             &headers,
-            br#"{"header":{"token":"verification-token"}}"#,
+            br#"{"challenge":"challenge-value","header":{"token":"verification-token"}}"#,
+            &payload,
+        ));
+    }
+
+    #[test]
+    fn webhook_signature_matches_lark_verification_token_sha1_vector() {
+        let body = br#"{"header":{"event_type":"card.action.trigger"},"event":{"value":1}}"#;
+        let payload: serde_json::Value = serde_json::from_slice(body).unwrap();
+        let mut headers = axum::http::HeaderMap::new();
+        headers.insert(
+            "x-lark-request-timestamp",
+            axum::http::HeaderValue::from_static("1720000000"),
+        );
+        headers.insert(
+            "x-lark-request-nonce",
+            axum::http::HeaderValue::from_static("test-nonce"),
+        );
+        headers.insert(
+            "x-lark-signature",
+            axum::http::HeaderValue::from_static("2356342c8e6f25515d394dfdb575eb1a1d5206b5"),
+        );
+
+        assert!(verify_lark_webhook_request(
+            "test_verification_token",
+            &headers,
+            body,
+            &payload,
+        ));
+
+        headers.insert(
+            "x-lark-signature",
+            axum::http::HeaderValue::from_static("e356342c8e6f25515d394dfdb575eb1a1d5206b5"),
+        );
+        assert!(!verify_lark_webhook_request(
+            "test_verification_token",
+            &headers,
+            body,
             &payload,
         ));
     }
@@ -6077,13 +6113,13 @@ mod tests {
         };
         use zeroclaw_api::channel::ChannelApprovalResponse;
 
-        fn signed_headers(body: &[u8], encrypt_key: &str) -> HeaderMap {
+        fn signed_headers(body: &[u8], verification_token: &str) -> HeaderMap {
             let timestamp = "1720000000";
             let nonce = "test-nonce";
-            let mut digest = Sha256::new();
+            let mut digest = Sha1::new();
             digest.update(timestamp.as_bytes());
             digest.update(nonce.as_bytes());
-            digest.update(encrypt_key.as_bytes());
+            digest.update(verification_token.as_bytes());
             digest.update(body);
 
             let mut headers = HeaderMap::new();
@@ -6106,7 +6142,7 @@ mod tests {
         ) -> axum::response::Response {
             let body = serde_json::to_vec(&envelope).unwrap();
             let headers = if authenticate {
-                signed_headers(&body, "test_encrypt_key")
+                signed_headers(&body, "test_verification_token")
             } else {
                 HeaderMap::new()
             };
@@ -6142,7 +6178,6 @@ mod tests {
         let (tx, mut messages) = tokio::sync::mpsc::channel(1);
         let state = LarkWebhookState {
             verification_token: "test_verification_token".to_string(),
-            encrypt_key: Some("test_encrypt_key".to_string()),
             channel: Arc::clone(&channel),
             tx,
         };
