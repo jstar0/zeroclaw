@@ -1,9 +1,12 @@
+use aes::Aes256;
 use async_trait::async_trait;
 use base64::Engine as _;
+use cbc::cipher::{BlockDecryptMut, KeyIvInit, block_padding::Pkcs7};
 use futures_util::{SinkExt, StreamExt};
 use prost::Message as ProstMessage;
 use reqwest::multipart::{Form, Part};
 use sha1::{Digest, Sha1};
+use sha2::Sha256;
 use std::borrow::Cow;
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -825,6 +828,40 @@ fn verify_lark_webhook_request(
     !verification_token.is_empty() && token == Some(verification_token)
 }
 
+fn decrypt_lark_webhook_body(body: &[u8], encrypt_key: Option<&str>) -> anyhow::Result<Vec<u8>> {
+    let envelope: serde_json::Value = serde_json::from_slice(body)
+        .map_err(|error| anyhow::Error::msg(format!("invalid webhook JSON payload: {error}")))?;
+    let Some(encrypted) = envelope
+        .get("encrypt")
+        .and_then(serde_json::Value::as_str)
+        .filter(|value| !value.is_empty())
+    else {
+        return Ok(body.to_vec());
+    };
+
+    let encrypt_key = encrypt_key
+        .filter(|value| !value.is_empty())
+        .ok_or_else(|| anyhow::Error::msg("encrypted webhook requires encrypt_key"))?;
+    let encrypted = base64::engine::general_purpose::STANDARD
+        .decode(encrypted)
+        .map_err(|error| {
+            anyhow::Error::msg(format!("invalid encrypted webhook payload: {error}"))
+        })?;
+    if encrypted.len() < 32 || (encrypted.len() - 16) % 16 != 0 {
+        anyhow::bail!("invalid encrypted webhook payload length");
+    }
+
+    let key = Sha256::digest(encrypt_key.as_bytes());
+    let iv = &encrypted[..16];
+    let mut ciphertext = encrypted[16..].to_vec();
+    let plaintext = cbc::Decryptor::<Aes256>::new(&key, iv.into())
+        .decrypt_padded_mut::<Pkcs7>(&mut ciphertext)
+        .map_err(|error| {
+            anyhow::Error::msg(format!("failed to decrypt webhook payload: {error}"))
+        })?;
+    Ok(plaintext.to_vec())
+}
+
 async fn handle_lark_webhook_event(
     axum::extract::State(state): axum::extract::State<LarkWebhookState>,
     headers: axum::http::HeaderMap,
@@ -833,7 +870,22 @@ async fn handle_lark_webhook_event(
     use axum::http::StatusCode;
     use axum::response::IntoResponse;
 
-    let payload: serde_json::Value = match serde_json::from_slice(&body) {
+    let decrypted_body =
+        match decrypt_lark_webhook_body(&body, state.channel.encrypt_key.as_deref()) {
+            Ok(body) => body,
+            Err(error) => {
+                ::zeroclaw_log::record!(
+                    WARN,
+                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Reject)
+                        .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                        .with_attrs(::serde_json::json!({"error": error.to_string()})),
+                    "Lark webhook: invalid or undecryptable payload"
+                );
+                return (StatusCode::BAD_REQUEST, "invalid webhook payload").into_response();
+            }
+        };
+
+    let payload: serde_json::Value = match serde_json::from_slice(&decrypted_body) {
         Ok(payload) => payload,
         Err(error) => {
             ::zeroclaw_log::record!(
@@ -841,7 +893,7 @@ async fn handle_lark_webhook_event(
                 ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Reject)
                     .with_outcome(::zeroclaw_log::EventOutcome::Failure)
                     .with_attrs(::serde_json::json!({"error": error.to_string()})),
-                "Lark webhook: invalid JSON payload"
+                "Lark webhook: invalid decrypted JSON payload"
             );
             return (StatusCode::BAD_REQUEST, "invalid JSON payload").into_response();
         }
@@ -3723,8 +3775,24 @@ impl LarkChannel {
         &self,
         tx: tokio::sync::mpsc::Sender<ChannelMessage>,
     ) -> anyhow::Result<()> {
-        self.ensure_bot_open_id().await;
         use axum::{Router, routing::post};
+
+        if self.verification_token.is_empty() {
+            ::zeroclaw_log::record!(
+                ERROR,
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Reject)
+                    .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                    .with_attrs(
+                        ::serde_json::json!({"mode": "webhook", "missing": "verification_token"})
+                    ),
+                "lark: webhook mode requires verification_token"
+            );
+            return Err(anyhow::Error::msg(
+                "webhook mode requires `verification_token` to be set",
+            ));
+        }
+
+        self.ensure_bot_open_id().await;
 
         let port = self.port.ok_or_else(|| {
             ::zeroclaw_log::record!(
@@ -6135,6 +6203,24 @@ mod tests {
             headers
         }
 
+        fn encrypted_body(plaintext: &[u8], encrypt_key: &str) -> Vec<u8> {
+            use cbc::cipher::{BlockEncryptMut, block_padding::Pkcs7};
+
+            let key = Sha256::digest(encrypt_key.as_bytes());
+            let iv = [0x42; 16];
+            let mut ciphertext = vec![0; plaintext.len() + 16];
+            ciphertext[..plaintext.len()].copy_from_slice(plaintext);
+            let ciphertext = cbc::Encryptor::<Aes256>::new((&key).into(), (&iv).into())
+                .encrypt_padded_mut::<Pkcs7>(&mut ciphertext, plaintext.len())
+                .unwrap();
+            let mut encrypted = iv.to_vec();
+            encrypted.extend_from_slice(ciphertext);
+            serde_json::to_vec(&serde_json::json!({
+                "encrypt": base64::engine::general_purpose::STANDARD.encode(encrypted)
+            }))
+            .unwrap()
+        }
+
         async fn post_card_action(
             state: LarkWebhookState,
             envelope: serde_json::Value,
@@ -6149,11 +6235,14 @@ mod tests {
             handle_lark_webhook_event(State(state), headers, Bytes::from(body)).await
         }
 
-        let channel = Arc::new(make_channel());
+        let mut configured_channel = make_channel();
+        configured_channel.encrypt_key = Some("test_encrypt_key".to_string());
+        let channel = Arc::new(configured_channel);
         let (approved_tx, approved_rx) = tokio::sync::oneshot::channel();
         let (wrong_chat_tx, _wrong_chat_rx) = tokio::sync::oneshot::channel();
         let (unauthorized_tx, _unauthorized_rx) = tokio::sync::oneshot::channel();
         let (forged_tx, mut forged_rx) = tokio::sync::oneshot::channel();
+        let (encrypted_tx, encrypted_rx) = tokio::sync::oneshot::channel();
         {
             let mut approvals = channel.pending_approvals.lock().await;
             for (approval_id, sender, destination) in [
@@ -6161,6 +6250,7 @@ mod tests {
                 ("WRONG001", wrong_chat_tx, "oc_origin"),
                 ("OTHER001", unauthorized_tx, "oc_origin"),
                 ("FORGED01", forged_tx, "oc_origin"),
+                ("ENCRYPT1", encrypted_tx, "oc_origin"),
             ] {
                 approvals.insert(
                     approval_id.to_string(),
@@ -6245,6 +6335,23 @@ mod tests {
                 .await
                 .is_err(),
             "card actions must not be emitted as ordinary channel messages"
+        );
+
+        let encrypted_envelope = envelope("ENCRYPT1", "ou_testuser123", "oc_origin", "approve");
+        let encrypted_body = encrypted_body(
+            &serde_json::to_vec(&encrypted_envelope).unwrap(),
+            "test_encrypt_key",
+        );
+        let encrypted_response = handle_lark_webhook_event(
+            State(state),
+            signed_headers(&encrypted_body, "test_verification_token"),
+            Bytes::from(encrypted_body),
+        )
+        .await;
+        assert_eq!(encrypted_response.status(), StatusCode::OK);
+        assert_eq!(
+            encrypted_rx.await.unwrap(),
+            ChannelApprovalResponse::Approve
         );
     }
 

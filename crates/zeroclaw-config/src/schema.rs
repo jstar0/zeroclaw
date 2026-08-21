@@ -16127,7 +16127,8 @@ pub struct LarkConfig {
     #[tab(Connection)]
     #[cfg_attr(feature = "schema-export", schemars(extend("x-secret" = true)))]
     pub encrypt_key: Option<String>,
-    /// Verification token for webhook validation and callback signature verification (optional).
+    /// Verification token for webhook validation and callback signature verification.
+    /// Required in webhook mode; optional in websocket mode.
     #[serde(default)]
     #[secret]
     #[tab(Connection)]
