@@ -2266,8 +2266,12 @@ mod tests {
         config.risk_profiles.get_mut(TEST_AGENT).unwrap().level =
             crate::security::AutonomyLevel::Full;
 
-        let security = test_security(&config);
+        let mut security = test_security(&config);
+        let scheduler_workspace = tmp.path().join("scheduler-owned-workspace");
+        std::fs::create_dir_all(&scheduler_workspace).unwrap();
+        security.workspace_dir = scheduler_workspace.clone();
         let expected_workspace = security.workspace_dir.clone();
+        assert_ne!(expected_workspace, config.agent_workspace_dir(TEST_AGENT));
         let mut job = test_job("");
         job.job_type = JobType::Agent;
         job.prompt = Some("Print the current workspace directory".into());
