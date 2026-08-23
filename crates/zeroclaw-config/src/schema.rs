@@ -25958,6 +25958,19 @@ enabled = true
     }
 
     #[test]
+    async fn validate_accepts_canonical_equivalent_ipv6_and_wildcard_carveouts() {
+        let mut config = Config::default();
+        config.plugins.entries.push(plugin_entry_with_egress(
+            &["[::1]", "*.example.com"],
+            &["[::1]", "*.sub.example.com"],
+        ));
+
+        config
+            .validate()
+            .expect("equivalent IPv6 and narrower wildcard grants must validate");
+    }
+
+    #[test]
     async fn validate_rejects_an_allow_all_egress_entry() {
         let mut config = Config::default();
         config
