@@ -113,6 +113,46 @@ impl AgentScopedMemory {
             .filter(|entry| entry.agent_id.is_some() && self.entry_allowed(entry))
             .collect()
     }
+
+    async fn recall_with_category_refill(
+        &self,
+        allowed_agent_ids: &[&str],
+        query: &str,
+        limit: usize,
+        session_id: Option<&str>,
+        since: Option<&str>,
+        until: Option<&str>,
+    ) -> Result<Vec<MemoryEntry>> {
+        if limit == 0 {
+            return Ok(Vec::new());
+        }
+
+        let mut fetch_limit = limit;
+        loop {
+            let entries = self
+                .inner
+                .recall_for_agents(
+                    allowed_agent_ids,
+                    query,
+                    fetch_limit,
+                    session_id,
+                    since,
+                    until,
+                )
+                .await?;
+            let backend_may_have_more = entries.len() >= fetch_limit;
+            let filtered = self.filter_entries(entries);
+            if filtered.len() >= limit || !backend_may_have_more {
+                return Ok(filtered.into_iter().take(limit).collect());
+            }
+
+            let next_fetch_limit = fetch_limit.saturating_mul(2);
+            if next_fetch_limit == fetch_limit {
+                return Ok(filtered.into_iter().take(limit).collect());
+            }
+            fetch_limit = next_fetch_limit;
+        }
+    }
 }
 
 #[async_trait]
@@ -275,11 +315,8 @@ impl Memory for AgentScopedMemory {
         until: Option<&str>,
     ) -> Result<Vec<MemoryEntry>> {
         let allowed = self.allowed_slice();
-        let entries = self
-            .inner
-            .recall_for_agents(&allowed, query, limit, session_id, since, until)
-            .await?;
-        Ok(self.filter_entries(entries))
+        self.recall_with_category_refill(&allowed, query, limit, session_id, since, until)
+            .await
     }
 
     async fn recall_for_agents(
@@ -294,10 +331,8 @@ impl Memory for AgentScopedMemory {
         if caller_allowed.is_empty() {
             let bound: Vec<&str> = self.allowed_agent_ids.iter().map(String::as_str).collect();
             return self
-                .inner
-                .recall_for_agents(&bound, query, limit, session_id, since, until)
-                .await
-                .map(|entries| self.filter_entries(entries));
+                .recall_with_category_refill(&bound, query, limit, session_id, since, until)
+                .await;
         }
 
         let intersected: Vec<&str> = caller_allowed
@@ -308,10 +343,8 @@ impl Memory for AgentScopedMemory {
         if intersected.is_empty() {
             return Ok(Vec::new());
         }
-        self.inner
-            .recall_for_agents(&intersected, query, limit, session_id, since, until)
+        self.recall_with_category_refill(&intersected, query, limit, session_id, since, until)
             .await
-            .map(|entries| self.filter_entries(entries))
     }
 
     async fn get(&self, key: &str) -> Result<Option<MemoryEntry>> {
@@ -799,6 +832,102 @@ mod tests {
             .await
             .unwrap();
         assert!(own.iter().any(|entry| entry.key == "own-daily"));
+    }
+
+    #[tokio::test]
+    async fn category_grant_refills_after_denied_rows_consume_limit() {
+        let (_tmp, inner) = fresh_sqlite();
+        let uuids = provision_agents(&inner, &["alpha", "beta"]).await;
+        let alpha_uuid = &uuids[0];
+        let beta_uuid = &uuids[1];
+
+        for idx in 0..12 {
+            inner
+                .store_with_agent(
+                    &format!("beta-denied-{idx}"),
+                    "needle denied row",
+                    MemoryCategory::Daily,
+                    None,
+                    None,
+                    None,
+                    Some(beta_uuid),
+                )
+                .await
+                .unwrap();
+        }
+        inner
+            .store_with_agent(
+                "beta-allowed",
+                "needle allowed row",
+                MemoryCategory::Custom("family".into()),
+                None,
+                None,
+                None,
+                Some(beta_uuid),
+            )
+            .await
+            .unwrap();
+
+        let wrapper = AgentScopedMemory::new_with_grants(
+            as_dyn(inner),
+            alpha_uuid,
+            [AgentMemoryGrant {
+                agent_id: beta_uuid.clone(),
+                categories: Some(["family".to_string()].into_iter().collect()),
+            }],
+        );
+
+        let results = wrapper.recall("needle", 1, None, None, None).await.unwrap();
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].key, "beta-allowed");
+    }
+
+    #[tokio::test]
+    async fn category_grant_refills_recent_rows_after_denied_matches_consume_limit() {
+        let (_tmp, inner) = fresh_sqlite();
+        let uuids = provision_agents(&inner, &["alpha", "beta"]).await;
+        let alpha_uuid = &uuids[0];
+        let beta_uuid = &uuids[1];
+
+        inner
+            .store_with_agent(
+                "beta-allowed",
+                "recent allowed row",
+                MemoryCategory::Custom("family".into()),
+                None,
+                None,
+                None,
+                Some(beta_uuid),
+            )
+            .await
+            .unwrap();
+        for idx in 0..12 {
+            inner
+                .store_with_agent(
+                    &format!("beta-denied-{idx}"),
+                    "recent denied row",
+                    MemoryCategory::Daily,
+                    None,
+                    None,
+                    None,
+                    Some(beta_uuid),
+                )
+                .await
+                .unwrap();
+        }
+
+        let wrapper = AgentScopedMemory::new_with_grants(
+            as_dyn(inner),
+            alpha_uuid,
+            [AgentMemoryGrant {
+                agent_id: beta_uuid.clone(),
+                categories: Some(["family".to_string()].into_iter().collect()),
+            }],
+        );
+
+        let results = wrapper.recall("*", 1, None, None, None).await.unwrap();
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].key, "beta-allowed");
     }
 
     #[tokio::test]

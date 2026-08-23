@@ -76,6 +76,38 @@ impl AgentScopedMarkdownMemory {
             })
             .collect()
     }
+
+    async fn recall_peer_with_category_refill(
+        peer: &MarkdownPeer,
+        query: &str,
+        limit: usize,
+        session_id: Option<&str>,
+        since: Option<&str>,
+        until: Option<&str>,
+    ) -> Result<Vec<MemoryEntry>> {
+        if limit == 0 {
+            return Ok(Vec::new());
+        }
+
+        let mut fetch_limit = limit;
+        loop {
+            let rows = peer
+                .memory
+                .recall(query, fetch_limit, session_id, since, until)
+                .await?;
+            let backend_may_have_more = rows.len() >= fetch_limit;
+            let filtered = Self::filter_peer_entries(peer.allowed_categories.as_ref(), rows);
+            if filtered.len() >= limit || !backend_may_have_more {
+                return Ok(filtered.into_iter().take(limit).collect());
+            }
+
+            let next_fetch_limit = fetch_limit.saturating_mul(2);
+            if next_fetch_limit == fetch_limit {
+                return Ok(filtered.into_iter().take(limit).collect());
+            }
+            fetch_limit = next_fetch_limit;
+        }
+    }
 }
 
 #[async_trait]
@@ -147,15 +179,12 @@ impl Memory for AgentScopedMarkdownMemory {
                 .await?,
         );
         for peer in &self.peers {
-            match peer
-                .memory
-                .recall(query, limit, session_id, since, until)
-                .await
+            match Self::recall_peer_with_category_refill(
+                peer, query, limit, session_id, since, until,
+            )
+            .await
             {
-                Ok(rows) => merged.extend(Self::attribute(
-                    &peer.alias,
-                    Self::filter_peer_entries(peer.allowed_categories.as_ref(), rows),
-                )),
+                Ok(rows) => merged.extend(Self::attribute(&peer.alias, rows)),
                 Err(error) => ::zeroclaw_log::record!(
                     WARN,
                     ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
@@ -203,15 +232,12 @@ impl Memory for AgentScopedMarkdownMemory {
             if !allowed_agent_ids.contains(&peer.alias.as_str()) {
                 continue;
             }
-            match peer
-                .memory
-                .recall(query, limit, session_id, since, until)
-                .await
+            match Self::recall_peer_with_category_refill(
+                peer, query, limit, session_id, since, until,
+            )
+            .await
             {
-                Ok(rows) => merged.extend(Self::attribute(
-                    &peer.alias,
-                    Self::filter_peer_entries(peer.allowed_categories.as_ref(), rows),
-                )),
+                Ok(rows) => merged.extend(Self::attribute(&peer.alias, rows)),
                 Err(error) => ::zeroclaw_log::record!(
                     WARN,
                     ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
@@ -392,6 +418,42 @@ mod tests {
                 .iter()
                 .any(|entry| entry.content.contains("beta daily"))
         );
+    }
+
+    #[tokio::test]
+    async fn recall_refills_peer_rows_after_denied_matches_consume_limit() {
+        let (_tmp_a, own) = make_md("alpha-ws");
+        let (_tmp_b, peer_mem) = make_md("beta-ws");
+
+        for idx in 0..12 {
+            peer_mem
+                .store(
+                    &format!("denied-{idx}"),
+                    "needle denied row",
+                    MemoryCategory::Core,
+                    None,
+                )
+                .await
+                .unwrap();
+        }
+        peer_mem
+            .store("allowed", "needle allowed row", MemoryCategory::Daily, None)
+            .await
+            .unwrap();
+
+        let scoped = AgentScopedMarkdownMemory::new(
+            "alpha",
+            Arc::new(own),
+            vec![MarkdownPeer {
+                alias: "beta".into(),
+                memory: Arc::new(peer_mem),
+                allowed_categories: Some(["daily".to_string()].into_iter().collect()),
+            }],
+        );
+
+        let results = scoped.recall("needle", 1, None, None, None).await.unwrap();
+        assert_eq!(results.len(), 1);
+        assert!(results[0].content.contains("needle allowed row"));
     }
 
     #[tokio::test]
