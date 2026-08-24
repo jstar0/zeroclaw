@@ -508,14 +508,31 @@ impl Memory for AgentScopedMemory {
         since: Option<&str>,
         until: Option<&str>,
     ) -> Result<Vec<MemoryEntry>> {
-        let entries = self
-            .recall(query, limit * 2, session_id, since, until)
-            .await?;
-        Ok(entries
-            .into_iter()
-            .filter(|e| e.namespace == namespace)
-            .take(limit)
-            .collect())
+        if limit == 0 {
+            return Ok(Vec::new());
+        }
+
+        let mut fetch_limit = limit;
+        loop {
+            let entries = self
+                .recall(query, fetch_limit, session_id, since, until)
+                .await?;
+            let backend_may_have_more = entries.len() >= fetch_limit;
+            let filtered: Vec<MemoryEntry> = entries
+                .into_iter()
+                .filter(|e| e.namespace == namespace)
+                .take(limit)
+                .collect();
+            if filtered.len() >= limit || !backend_may_have_more {
+                return Ok(filtered);
+            }
+
+            let next_fetch_limit = fetch_limit.saturating_mul(2);
+            if next_fetch_limit == fetch_limit {
+                return Ok(filtered);
+            }
+            fetch_limit = next_fetch_limit;
+        }
     }
 
     async fn export(&self, filter: &ExportFilter) -> Result<Vec<MemoryEntry>> {
@@ -928,6 +945,59 @@ mod tests {
         let results = wrapper.recall("*", 1, None, None, None).await.unwrap();
         assert_eq!(results.len(), 1);
         assert_eq!(results[0].key, "beta-allowed");
+    }
+
+    #[tokio::test]
+    async fn namespaced_recall_refills_after_allowed_rows_in_other_namespaces() {
+        let (_tmp, inner) = fresh_sqlite();
+        let uuids = provision_agents(&inner, &["alpha", "beta"]).await;
+        let alpha_uuid = &uuids[0];
+        let beta_uuid = &uuids[1];
+
+        inner
+            .store_with_agent(
+                "beta-wanted",
+                "needle wanted",
+                MemoryCategory::Custom("family".into()),
+                None,
+                Some("wanted"),
+                None,
+                Some(beta_uuid),
+            )
+            .await
+            .unwrap();
+        for idx in 0..2 {
+            inner
+                .store_with_agent(
+                    &format!("beta-other-{idx}"),
+                    "needle other",
+                    MemoryCategory::Custom("family".into()),
+                    None,
+                    Some("other"),
+                    None,
+                    Some(beta_uuid),
+                )
+                .await
+                .unwrap();
+        }
+
+        let wrapper = AgentScopedMemory::new_with_grants(
+            as_dyn(inner),
+            alpha_uuid,
+            [AgentMemoryGrant {
+                agent_id: beta_uuid.clone(),
+                categories: Some(["family".to_string()].into_iter().collect()),
+            }],
+        );
+
+        for query in ["needle", "*"] {
+            let results = wrapper
+                .recall_namespaced("wanted", query, 1, None, None, None)
+                .await
+                .unwrap();
+            assert_eq!(results.len(), 1, "query={query}");
+            assert_eq!(results[0].key, "beta-wanted", "query={query}");
+        }
     }
 
     #[tokio::test]

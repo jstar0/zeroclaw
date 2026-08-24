@@ -370,6 +370,36 @@ read_memory_from = [
     }
 
     #[test]
+    fn memory_grant_set_prop_preserves_legacy_and_mixed_inputs() {
+        let mut config = AgentWorkspaceConfig::default();
+
+        config
+            .set_prop("agent_workspace.read_memory_from", "beta, gamma")
+            .unwrap();
+        assert_eq!(
+            config
+                .read_memory_from
+                .iter()
+                .map(MemoryGrant::as_str)
+                .collect::<Vec<_>>(),
+            vec!["beta", "gamma"]
+        );
+
+        config
+            .set_prop(
+                "agent_workspace.read_memory_from",
+                r#"["beta", {"agent":"gamma", "categories":["facts"]}]"#,
+            )
+            .unwrap();
+        assert_eq!(config.read_memory_from.len(), 2);
+        assert_eq!(config.read_memory_from[1].as_str(), "gamma");
+        assert_eq!(
+            config.read_memory_from[1].categories(),
+            Some(["facts".to_string()].as_slice())
+        );
+    }
+
+    #[test]
     fn agent_memory_config_round_trips() {
         let toml_input = r#"backend = "postgres""#;
         let parsed: AgentMemoryConfig = toml::from_str(toml_input).unwrap();

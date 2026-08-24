@@ -309,6 +309,123 @@ mod tests {
         (tmp, mem)
     }
 
+    struct NamespacedTestMemory {
+        entries: Vec<MemoryEntry>,
+    }
+
+    impl ::zeroclaw_api::attribution::Attributable for NamespacedTestMemory {
+        fn role(&self) -> ::zeroclaw_api::attribution::Role {
+            ::zeroclaw_api::attribution::Role::Memory(
+                ::zeroclaw_api::attribution::MemoryKind::InMemory,
+            )
+        }
+
+        fn alias(&self) -> &str {
+            "namespaced-test"
+        }
+    }
+
+    #[async_trait]
+    impl Memory for NamespacedTestMemory {
+        fn name(&self) -> &str {
+            "namespaced-test"
+        }
+
+        async fn store(
+            &self,
+            _key: &str,
+            _content: &str,
+            _category: MemoryCategory,
+            _session_id: Option<&str>,
+        ) -> Result<()> {
+            Ok(())
+        }
+
+        async fn recall(
+            &self,
+            _query: &str,
+            limit: usize,
+            _session_id: Option<&str>,
+            _since: Option<&str>,
+            _until: Option<&str>,
+        ) -> Result<Vec<MemoryEntry>> {
+            Ok(self.entries.iter().take(limit).cloned().collect())
+        }
+
+        async fn get(&self, key: &str) -> Result<Option<MemoryEntry>> {
+            Ok(self.entries.iter().find(|entry| entry.key == key).cloned())
+        }
+
+        async fn list(
+            &self,
+            _category: Option<&MemoryCategory>,
+            _session_id: Option<&str>,
+        ) -> Result<Vec<MemoryEntry>> {
+            Ok(self.entries.clone())
+        }
+
+        async fn forget(&self, _key: &str) -> Result<bool> {
+            Ok(false)
+        }
+
+        async fn forget_for_agent(&self, _key: &str, _agent_id: &str) -> Result<bool> {
+            Ok(false)
+        }
+
+        async fn count(&self) -> Result<usize> {
+            Ok(self.entries.len())
+        }
+
+        async fn health_check(&self) -> bool {
+            true
+        }
+
+        async fn store_with_agent(
+            &self,
+            _key: &str,
+            _content: &str,
+            _category: MemoryCategory,
+            _session_id: Option<&str>,
+            _namespace: Option<&str>,
+            _importance: Option<f64>,
+            _agent_id: Option<&str>,
+        ) -> Result<()> {
+            Ok(())
+        }
+
+        async fn recall_for_agents(
+            &self,
+            _allowed_agent_ids: &[&str],
+            query: &str,
+            limit: usize,
+            session_id: Option<&str>,
+            since: Option<&str>,
+            until: Option<&str>,
+        ) -> Result<Vec<MemoryEntry>> {
+            self.recall(query, limit, session_id, since, until).await
+        }
+    }
+
+    fn namespaced_entry(key: &str, namespace: &str) -> MemoryEntry {
+        MemoryEntry {
+            id: key.into(),
+            key: key.into(),
+            content: "needle".into(),
+            category: MemoryCategory::Custom("family".into()),
+            timestamp: "2026-08-24T00:00:00Z".into(),
+            session_id: None,
+            score: Some(1.0),
+            namespace: namespace.into(),
+            importance: None,
+            superseded_by: None,
+            kind: None,
+            pinned: false,
+            tenant_id: None,
+            agent_alias: None,
+            agent_id: None,
+        }
+    }
+
     #[tokio::test]
     async fn store_writes_only_to_own_backend() {
         let (_tmp_a, own) = make_md("alpha-ws");
@@ -454,6 +571,37 @@ mod tests {
         let results = scoped.recall("needle", 1, None, None, None).await.unwrap();
         assert_eq!(results.len(), 1);
         assert!(results[0].content.contains("needle allowed row"));
+    }
+
+    #[tokio::test]
+    async fn namespaced_recall_refills_markdown_peer_rows() {
+        let own = NamespacedTestMemory {
+            entries: Vec::new(),
+        };
+        let peer = NamespacedTestMemory {
+            entries: vec![
+                namespaced_entry("peer-other", "other"),
+                namespaced_entry("peer-wanted", "wanted"),
+            ],
+        };
+        let scoped = AgentScopedMarkdownMemory::new(
+            "alpha",
+            Arc::new(own),
+            vec![MarkdownPeer {
+                alias: "beta".into(),
+                memory: Arc::new(peer),
+                allowed_categories: None,
+            }],
+        );
+
+        for query in ["needle", "*"] {
+            let results = scoped
+                .recall_namespaced("wanted", query, 1, None, None, None)
+                .await
+                .unwrap();
+            assert_eq!(results.len(), 1, "query={query}");
+            assert_eq!(results[0].key, "[beta] peer-wanted", "query={query}");
+        }
     }
 
     #[tokio::test]

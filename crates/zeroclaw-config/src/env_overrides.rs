@@ -206,7 +206,8 @@ pub(crate) async fn env_test_lock() -> tokio::sync::MutexGuard<'static, ()> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::schema::Config;
+    use crate::multi_agent::MemoryGrant;
+    use crate::schema::{AliasedAgentConfig, Config};
 
     struct EnvVarGuard(&'static str);
     impl EnvVarGuard {
@@ -315,6 +316,35 @@ mod tests {
         assert_eq!(
             entry.base.model.as_deref(),
             Some("anthropic/claude-sonnet-4-6"),
+        );
+    }
+
+    #[tokio::test]
+    async fn walker_preserves_legacy_memory_grant_input_and_mixed_json() {
+        let _guard = super::env_test_lock().await;
+        let _v = EnvVarGuard::set(
+            "ZEROCLAW_agents__alpha__workspace__read_memory_from",
+            r#"["beta", {"agent":"gamma", "categories":["facts"]}]"#,
+        );
+
+        let mut config = Config::default();
+        config
+            .agents
+            .insert("alpha".into(), AliasedAgentConfig::default());
+        let applied = apply_env_overrides(&mut config).expect("apply succeeds");
+
+        assert!(
+            applied
+                .paths
+                .contains("agents.alpha.workspace.read_memory_from")
+        );
+        let grants = &config.agents["alpha"].workspace.read_memory_from;
+        assert_eq!(grants.len(), 2);
+        assert!(matches!(grants[0], MemoryGrant::Agent(_)));
+        assert_eq!(grants[1].as_str(), "gamma");
+        assert_eq!(
+            grants[1].categories(),
+            Some(["facts".to_string()].as_slice())
         );
     }
 
