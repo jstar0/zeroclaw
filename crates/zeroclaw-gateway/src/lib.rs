@@ -2840,7 +2840,7 @@ fn idempotency_storage_key(namespace: Option<&str>, idempotency_key: &str) -> St
 /// Emit duplicate telemetry without copying caller-controlled key material
 /// into the log pipeline. The key remains available to the replay store; only
 /// its presence is useful and safe at this observability boundary.
-fn record_duplicate_idempotency_log(_idempotency_key: &str) {
+fn record_duplicate_idempotency_log() {
     ::zeroclaw_log::record!(
         INFO,
         ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
@@ -2864,7 +2864,7 @@ fn check_webhook_idempotency(
         return None;
     }
 
-    record_duplicate_idempotency_log(idempotency_key);
+    record_duplicate_idempotency_log();
     Some((
         StatusCode::OK,
         Json(serde_json::json!({
@@ -8408,7 +8408,7 @@ path = "{trigger_path}"
         while receiver.try_recv().is_ok() {}
 
         let raw_key = "caller-sensitive-id";
-        record_duplicate_idempotency_log(raw_key);
+        record_duplicate_idempotency_log();
 
         let event = loop {
             match receiver.try_recv() {
