@@ -157,27 +157,11 @@ impl QdrantMemory {
             "filter": { "must": must_conditions }
         });
 
-        let resp = self
-            .request(
-                reqwest::Method::POST,
-                &format!("/collections/{}/points/scroll", self.collection),
-            )
-            .json(&scroll_body)
-            .send()
-            .await
-            .context("failed to scroll Qdrant for allowed agent set")?;
+        let points = self
+            .scroll_all(scroll_body, "failed to scroll Qdrant for allowed agent set")
+            .await?;
 
-        if !resp.status().is_success() {
-            let status = resp.status();
-            let text = resp.text().await.unwrap_or_default();
-            anyhow::bail!("Qdrant scroll failed ({status}): {text}");
-        }
-
-        let result: QdrantScrollResult = resp.json().await?;
-
-        let entries = result
-            .result
-            .points
+        let entries = points
             .into_iter()
             .filter_map(|point| {
                 let payload = point.payload?;
@@ -208,6 +192,42 @@ impl QdrantMemory {
             .collect();
 
         Ok(entries)
+    }
+
+    async fn scroll_all(
+        &self,
+        mut scroll_body: serde_json::Value,
+        context: &'static str,
+    ) -> Result<Vec<QdrantPoint>> {
+        let mut points = Vec::new();
+
+        loop {
+            let resp = self
+                .request(
+                    reqwest::Method::POST,
+                    &format!("/collections/{}/points/scroll", self.collection),
+                )
+                .json(&scroll_body)
+                .send()
+                .await
+                .context(context)?;
+
+            if !resp.status().is_success() {
+                let status = resp.status();
+                let text = resp.text().await.unwrap_or_default();
+                anyhow::bail!("Qdrant scroll failed ({status}): {text}");
+            }
+
+            let page: QdrantScrollResult = resp.json().await?;
+            points.extend(page.result.points);
+
+            match page.result.next_page_offset {
+                Some(offset) if !offset.is_null() => scroll_body["offset"] = offset,
+                _ => break,
+            }
+        }
+
+        Ok(points)
     }
 
     async fn ensure_collection(&self) -> Result<()> {
@@ -731,27 +751,11 @@ impl Memory for QdrantMemory {
             scroll_body["filter"] = serde_json::json!({ "must": must_conditions });
         }
 
-        let resp = self
-            .request(
-                reqwest::Method::POST,
-                &format!("/collections/{}/points/scroll", self.collection),
-            )
-            .json(&scroll_body)
-            .send()
-            .await
-            .context("failed to scroll Qdrant")?;
+        let points = self
+            .scroll_all(scroll_body, "failed to scroll Qdrant")
+            .await?;
 
-        if !resp.status().is_success() {
-            let status = resp.status();
-            let text = resp.text().await.unwrap_or_default();
-            anyhow::bail!("Qdrant scroll failed ({status}): {text}");
-        }
-
-        let result: QdrantScrollResult = resp.json().await?;
-
-        let entries = result
-            .result
-            .points
+        let entries = points
             .into_iter()
             .filter_map(|point| {
                 let payload = point.payload?;
@@ -1113,6 +1117,124 @@ impl ::zeroclaw_api::attribution::Attributable for QdrantMemory {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn read_http_request(stream: &mut std::net::TcpStream) -> String {
+        use std::io::Read;
+
+        let mut request = Vec::new();
+        let mut buffer = [0; 4096];
+        loop {
+            let read = stream.read(&mut buffer).unwrap();
+            assert!(
+                read > 0,
+                "Qdrant fixture closed before the request body arrived"
+            );
+            request.extend_from_slice(&buffer[..read]);
+
+            let Some(header_end) = request.windows(4).position(|window| window == b"\r\n\r\n")
+            else {
+                continue;
+            };
+            let header = String::from_utf8_lossy(&request[..header_end]);
+            let content_length = header
+                .lines()
+                .find_map(|line| {
+                    let (name, value) = line.split_once(':')?;
+                    name.eq_ignore_ascii_case("content-length")
+                        .then_some(value.trim())
+                })
+                .unwrap()
+                .parse::<usize>()
+                .unwrap();
+            if request.len() >= header_end + 4 + content_length {
+                return String::from_utf8(request).unwrap();
+            }
+        }
+    }
+
+    fn qdrant_fixture_point(id: usize) -> serde_json::Value {
+        serde_json::json!({
+            "id": id,
+            "payload": {
+                "key": format!("key-{id}"),
+                "content": format!("content-{id}"),
+                "category": "daily",
+                "timestamp": "2026-08-25T00:00:00Z",
+                "agent_id": "alpha"
+            }
+        })
+    }
+
+    #[tokio::test]
+    async fn list_operations_follow_qdrant_scroll_continuation() {
+        use std::io::Write;
+        use std::net::TcpListener;
+        use std::thread;
+
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let endpoint = format!("http://{}", listener.local_addr().unwrap());
+        let server = thread::spawn(move || {
+            for request_index in 0..4 {
+                let (mut stream, _) = listener.accept().unwrap();
+                let request = read_http_request(&mut stream);
+                let body = request.split_once("\r\n\r\n").unwrap().1;
+                let body: serde_json::Value = serde_json::from_str(body).unwrap();
+
+                assert_eq!(
+                    body["filter"]["must"].as_array().is_some_and(|must| {
+                        must.iter().any(|condition| condition["key"] == "agent_id")
+                    }),
+                    request_index < 2,
+                    "scoped and unscoped list requests must keep their filters"
+                );
+                let expected_offset = (request_index % 2 == 1).then(|| serde_json::json!(1000));
+                assert_eq!(
+                    body.get("offset"),
+                    expected_offset.as_ref(),
+                    "the second page must carry Qdrant's continuation offset"
+                );
+
+                let points: Vec<_> = if request_index % 2 == 0 {
+                    (0..1000).map(qdrant_fixture_point).collect()
+                } else {
+                    vec![qdrant_fixture_point(1000)]
+                };
+                let next_page_offset = if request_index % 2 == 0 {
+                    serde_json::json!(1000)
+                } else {
+                    serde_json::Value::Null
+                };
+                let response_body = serde_json::json!({
+                    "result": {
+                        "points": points,
+                        "next_page_offset": next_page_offset
+                    }
+                })
+                .to_string();
+                write!(
+                    stream,
+                    "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                    response_body.len(),
+                    response_body
+                )
+                .unwrap();
+            }
+        });
+
+        let mem = QdrantMemory::new_lazy(
+            "test",
+            &endpoint,
+            "mem",
+            None,
+            Arc::new(super::super::embeddings::NoopEmbedding),
+        );
+        let scoped = mem.list_for_agents(&["alpha"], None, None).await.unwrap();
+        let unscoped = Memory::list(&mem, None, None).await.unwrap();
+        server.join().unwrap();
+
+        assert_eq!(scoped.len(), 1001);
+        assert_eq!(unscoped.len(), 1001);
+    }
 
     #[test]
     fn refresh_embedder_swaps_embedder_in_place() {
