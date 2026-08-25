@@ -67,7 +67,18 @@ impl AgentScopedMemory {
         let mut allowed_categories = HashMap::new();
         for grant in grants {
             allowed_agent_ids.insert(grant.agent_id.clone());
-            allowed_categories.insert(grant.agent_id, grant.categories);
+            match allowed_categories.entry(grant.agent_id) {
+                std::collections::hash_map::Entry::Vacant(entry) => {
+                    entry.insert(grant.categories);
+                }
+                std::collections::hash_map::Entry::Occupied(mut entry) => {
+                    // Duplicate grants are invalid configuration. If one
+                    // reaches this lower-level constructor despite the
+                    // factory guard, deny the source completely rather than
+                    // letting iteration order widen a scoped grant.
+                    entry.insert(Some(HashSet::new()));
+                }
+            }
         }
         allowed_agent_ids.insert(agent_id.clone());
         allowed_categories.insert(agent_id.clone(), None);

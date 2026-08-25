@@ -988,6 +988,20 @@ pub async fn create_memory_for_agent(
         .with_context(|| format!("agents.{agent_alias} is not configured"))?;
     let backend_kind = agent_cfg.memory.backend;
 
+    // Config::validate rejects duplicate source grants, but boot deliberately
+    // remains validation-resilient so operators can repair malformed config
+    // through the dashboard. Refuse the ambiguous grant set at the runtime
+    // boundary before any wrapper can resolve it with order-dependent policy.
+    let mut seen_grants = std::collections::HashSet::new();
+    for grant in &agent_cfg.workspace.read_memory_from {
+        if !seen_grants.insert(grant.as_str()) {
+            anyhow::bail!(
+                "agents.{agent_alias}.workspace.read_memory_from contains duplicate grant for agent {:?}; combine categories into one grant",
+                grant.as_str()
+            );
+        }
+    }
+
     // Typed-memory producers are SQLite-only. Config::validate already
     // rejects this combination on every save path, but boot is
     // deliberately validation-resilient (a hand-edited config still
@@ -2814,6 +2828,41 @@ store_timeout_ms = 40000
             .unwrap();
         let fresh = handle_a.recall("fact", 10, None, None, None).await.unwrap();
         assert_eq!(fresh.len(), 3, "the decorator must preserve direct recall");
+    }
+
+    #[tokio::test]
+    async fn create_memory_for_agent_rejects_duplicate_grants_before_wrapper() {
+        let tmp = TempDir::new().unwrap();
+        let mut config = agent_config(&tmp);
+        config.agents.insert(
+            "beta".to_string(),
+            zeroclaw_config::schema::AliasedAgentConfig::default(),
+        );
+        let scoped = zeroclaw_config::multi_agent::MemoryGrant::Scoped {
+            agent: zeroclaw_config::multi_agent::AgentAlias::new("beta"),
+            categories: Some(vec!["core".to_string()]),
+        };
+        let unrestricted = zeroclaw_config::multi_agent::MemoryGrant::Agent(
+            zeroclaw_config::multi_agent::AgentAlias::new("beta"),
+        );
+
+        for grants in [
+            [scoped.clone(), unrestricted.clone()],
+            [unrestricted, scoped],
+        ] {
+            let mut candidate = config.clone();
+            candidate
+                .agents
+                .get_mut("ops")
+                .unwrap()
+                .workspace
+                .read_memory_from = grants.into();
+            let error = match create_memory_for_agent(&candidate, "ops", None).await {
+                Ok(_) => panic!("ambiguous duplicate grants must fail closed"),
+                Err(error) => error,
+            };
+            assert!(error.to_string().contains("duplicate grant"));
+        }
     }
 
     /// The reserved `"fts"` / `"vector"` stage names do not enable caching, so
