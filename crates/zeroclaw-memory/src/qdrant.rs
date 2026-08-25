@@ -202,23 +202,7 @@ impl QdrantMemory {
         let mut points = Vec::new();
 
         loop {
-            let resp = self
-                .request(
-                    reqwest::Method::POST,
-                    &format!("/collections/{}/points/scroll", self.collection),
-                )
-                .json(&scroll_body)
-                .send()
-                .await
-                .context(context)?;
-
-            if !resp.status().is_success() {
-                let status = resp.status();
-                let text = resp.text().await.unwrap_or_default();
-                anyhow::bail!("Qdrant scroll failed ({status}): {text}");
-            }
-
-            let page: QdrantScrollResult = resp.json().await?;
+            let page = self.scroll_page(&scroll_body, context).await?;
             points.extend(page.result.points);
 
             match page.result.next_page_offset {
@@ -228,6 +212,131 @@ impl QdrantMemory {
         }
 
         Ok(points)
+    }
+
+    async fn scroll_page(
+        &self,
+        scroll_body: &serde_json::Value,
+        context: &'static str,
+    ) -> Result<QdrantScrollResult> {
+        let resp = self
+            .request(
+                reqwest::Method::POST,
+                &format!("/collections/{}/points/scroll", self.collection),
+            )
+            .json(scroll_body)
+            .send()
+            .await
+            .context(context)?;
+
+        if !resp.status().is_success() {
+            let status = resp.status();
+            let text = resp.text().await.unwrap_or_default();
+            anyhow::bail!("Qdrant scroll failed ({status}): {text}");
+        }
+
+        Ok(resp.json().await?)
+    }
+
+    async fn list_limited(
+        &self,
+        allowed_agent_ids: Option<&[&str]>,
+        session_id: Option<&str>,
+        limit: usize,
+        since: Option<&str>,
+        until: Option<&str>,
+    ) -> Result<Vec<MemoryEntry>> {
+        if limit == 0 {
+            return Ok(Vec::new());
+        }
+
+        self.ensure_initialized().await?;
+
+        let mut must_conditions: Vec<serde_json::Value> = Vec::new();
+        if let Some(sid) = session_id {
+            must_conditions.push(serde_json::json!({
+                "key": "session_id",
+                "match": { "value": sid }
+            }));
+        }
+        if let Some(agent_ids) = allowed_agent_ids {
+            must_conditions.push(serde_json::json!({
+                "key": "agent_id",
+                "match": { "any": agent_ids }
+            }));
+        }
+
+        let page_limit = limit.min(1000);
+        let mut scroll_body = serde_json::json!({
+            "limit": page_limit,
+            "with_payload": true
+        });
+        if !must_conditions.is_empty() {
+            scroll_body["filter"] = serde_json::json!({ "must": must_conditions });
+        }
+
+        let mut entries = Vec::with_capacity(page_limit);
+        loop {
+            let page = self
+                .scroll_page(&scroll_body, "failed to scroll Qdrant for bounded recall")
+                .await?;
+
+            for point in page.result.points {
+                let Some(payload) = point.payload else {
+                    continue;
+                };
+                let id = match point.id {
+                    serde_json::Value::String(id) => id,
+                    serde_json::Value::Number(id) => id.to_string(),
+                    _ => continue,
+                };
+                let timestamp = payload.timestamp.clone();
+                if since.is_some_and(|value| timestamp.as_str() < value)
+                    || until.is_some_and(|value| timestamp.as_str() > value)
+                {
+                    continue;
+                }
+
+                entries.push(MemoryEntry {
+                    id,
+                    key: payload.key,
+                    content: payload.content,
+                    category: Self::parse_category(&payload.category),
+                    timestamp,
+                    session_id: payload.session_id,
+                    score: None,
+                    namespace: "default".into(),
+                    importance: None,
+                    superseded_by: None,
+                    kind: None,
+                    pinned: false,
+                    tenant_id: None,
+                    agent_alias: payload.agent_id.clone(),
+                    agent_id: payload.agent_id,
+                });
+
+                if entries.len() >= limit {
+                    return Ok(entries);
+                }
+            }
+
+            match page.result.next_page_offset {
+                Some(offset) if !offset.is_null() => scroll_body["offset"] = offset,
+                _ => return Ok(entries),
+            }
+        }
+    }
+
+    async fn list_for_agents_limited(
+        &self,
+        allowed_agent_ids: &[&str],
+        session_id: Option<&str>,
+        limit: usize,
+        since: Option<&str>,
+        until: Option<&str>,
+    ) -> Result<Vec<MemoryEntry>> {
+        self.list_limited(Some(allowed_agent_ids), session_id, limit, since, until)
+            .await
     }
 
     async fn ensure_collection(&self) -> Result<()> {
@@ -607,15 +716,9 @@ impl Memory for QdrantMemory {
         until: Option<&str>,
     ) -> Result<Vec<MemoryEntry>> {
         if is_recent_recall_query(query) {
-            let mut entries = self.list(None, session_id).await?;
-            if let Some(s) = since {
-                entries.retain(|e| e.timestamp.as_str() >= s);
-            }
-            if let Some(u) = until {
-                entries.retain(|e| e.timestamp.as_str() <= u);
-            }
-            entries.truncate(limit);
-            return Ok(entries);
+            return self
+                .list_limited(None, session_id, limit, since, until)
+                .await;
         }
 
         self.ensure_initialized().await?;
@@ -626,7 +729,9 @@ impl Memory for QdrantMemory {
 
         if embedding.is_empty() {
             // Fallback to listing if embeddings aren't available
-            return self.list(None, session_id).await;
+            return self
+                .list_limited(None, session_id, limit, since, until)
+                .await;
         }
 
         // Build filter for session_id if provided
@@ -1002,17 +1107,9 @@ impl Memory for QdrantMemory {
         // Recent/time-only branch: scroll with a payload `must` filter
         // on `agent_id` so unattributed points never reach the caller.
         if is_recent_recall_query(query) {
-            let mut entries = self
-                .list_for_agents(allowed_agent_ids, None, session_id)
-                .await?;
-            if let Some(s) = since {
-                entries.retain(|e| e.timestamp.as_str() >= s);
-            }
-            if let Some(u) = until {
-                entries.retain(|e| e.timestamp.as_str() <= u);
-            }
-            entries.truncate(limit);
-            return Ok(entries);
+            return self
+                .list_for_agents_limited(allowed_agent_ids, session_id, limit, since, until)
+                .await;
         }
 
         self.ensure_initialized().await?;
@@ -1023,7 +1120,7 @@ impl Memory for QdrantMemory {
             // No embedding available: fall back to listing under the
             // allowlist. Same surface as `recall`'s fallback.
             return self
-                .list_for_agents(allowed_agent_ids, None, session_id)
+                .list_for_agents_limited(allowed_agent_ids, session_id, limit, since, until)
                 .await;
         }
 
@@ -1117,6 +1214,23 @@ impl ::zeroclaw_api::attribution::Attributable for QdrantMemory {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    struct EmptyVectorEmbedding;
+
+    #[async_trait::async_trait]
+    impl EmbeddingProvider for EmptyVectorEmbedding {
+        fn name(&self) -> &str {
+            "empty"
+        }
+
+        fn dimensions(&self) -> usize {
+            0
+        }
+
+        async fn embed(&self, _texts: &[&str]) -> anyhow::Result<Vec<Vec<f32>>> {
+            Ok(vec![Vec::new()])
+        }
+    }
 
     fn read_http_request(stream: &mut std::net::TcpStream) -> String {
         use std::io::Read;
@@ -1234,6 +1348,62 @@ mod tests {
 
         assert_eq!(scoped.len(), 1001);
         assert_eq!(unscoped.len(), 1001);
+    }
+
+    #[tokio::test]
+    async fn scoped_recent_and_fallback_recall_do_not_follow_pages_after_limit() {
+        use std::io::Write;
+        use std::net::TcpListener;
+        use std::thread;
+
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let endpoint = format!("http://{}", listener.local_addr().unwrap());
+        let server = thread::spawn(move || {
+            for _ in 0..2 {
+                let (mut stream, _) = listener.accept().unwrap();
+                let request = read_http_request(&mut stream);
+                let body = request.split_once("\r\n\r\n").unwrap().1;
+                let body: serde_json::Value = serde_json::from_str(body).unwrap();
+
+                assert_eq!(body["limit"], 2);
+                assert!(body["filter"]["must"].as_array().is_some_and(|must| {
+                    must.iter().any(|condition| condition["key"] == "agent_id")
+                }));
+
+                let response_body = serde_json::json!({
+                    "result": {
+                        "points": [qdrant_fixture_point(0), qdrant_fixture_point(1)],
+                        "next_page_offset": 2
+                    }
+                })
+                .to_string();
+                write!(
+                    stream,
+                    "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                    response_body.len(),
+                    response_body
+                )
+                .unwrap();
+            }
+        });
+
+        let mem = QdrantMemory::new_lazy(
+            "test",
+            &endpoint,
+            "mem",
+            None,
+            Arc::new(EmptyVectorEmbedding),
+        );
+        let recent = Memory::recall_for_agents(&mem, &["alpha"], "", 2, None, None, None)
+            .await
+            .unwrap();
+        let fallback = Memory::recall_for_agents(&mem, &["alpha"], "keyword", 2, None, None, None)
+            .await
+            .unwrap();
+        server.join().unwrap();
+
+        assert_eq!(recent.len(), 2);
+        assert_eq!(fallback.len(), 2);
     }
 
     #[test]
