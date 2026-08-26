@@ -807,9 +807,9 @@ jobs:
           emit nix      "\.nix$|^flake\.(nix|lock)$|^nix/|${wf}"
           emit nix_hash "(^|/)Cargo\.(toml|lock)$|^nix/hashes\.json$|^scripts/ci/list_git_dep_keys\.py$|${wf}"
           # The generated dashboard contract includes schemas owned by the
-          # config and runtime crates and is rendered by the xtask generator.
+          # config, runtime, and SOP graph crates and is rendered by the xtask generator.
           # Keep this trigger aligned with every source that can change it.
-          emit web      "^web/|^crates/zeroclaw-(config|gateway|runtime)/|^xtask/|^Cargo\.(toml|lock)$|^\.nvmrc$|${wf}"
+          emit web      "^web/|^crates/zeroclaw-(config|gateway|runtime|sop-graph)/|^xtask/|^Cargo\.(toml|lock)$|^\.nvmrc$|${wf}"
 
   nix-eval:
     name: Nix Module Eval
