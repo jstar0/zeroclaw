@@ -10,6 +10,7 @@ use zeroclaw_config::schema::Config;
 pub struct CronRunTool {
     config: Arc<Config>,
     security: Arc<SecurityPolicy>,
+    agent_alias: String,
     runtime: Arc<dyn RuntimeAdapter>,
 }
 
@@ -17,11 +18,13 @@ impl CronRunTool {
     pub fn new_with_runtime(
         config: Arc<Config>,
         security: Arc<SecurityPolicy>,
+        agent_alias: impl Into<String>,
         runtime: Arc<dyn RuntimeAdapter>,
     ) -> Self {
         Self {
             config,
             security,
+            agent_alias: agent_alias.into(),
             runtime,
         }
     }
@@ -32,7 +35,7 @@ impl CronRunTool {
             crate::platform::create_runtime(&config.runtime)
                 .expect("test config must construct its runtime"),
         );
-        Self::new_with_runtime(config, security, runtime)
+        Self::new_with_runtime(config, security, "test-agent", runtime)
     }
 }
 
@@ -101,7 +104,7 @@ impl Tool for CronRunTool {
             });
         }
 
-        let job = match cron::get_job(&self.config, job_id) {
+        let job = match cron::get_job_for_agent(&self.config, job_id, &self.agent_alias) {
             Ok(job) => job,
             Err(e) => {
                 return Ok(ToolResult {
@@ -135,6 +138,31 @@ impl Tool for CronRunTool {
             });
         }
 
+        let claimed = match cron::claim_job_for_agent(
+            &self.config,
+            &job.id,
+            &self.agent_alias,
+            chrono::Utc::now(),
+        ) {
+            Ok(claimed) => claimed,
+            Err(e) => {
+                return Ok(ToolResult {
+                    success: false,
+                    output: ToolOutput::default(),
+                    error: Some(e.to_string()),
+                });
+            }
+        };
+        if !claimed {
+            return Ok(ToolResult {
+                success: false,
+                output: ToolOutput::default(),
+                error: Some(format!(
+                    "Cron job '{job_id}' not found or is already in flight"
+                )),
+            });
+        }
+
         let result = cron::scheduler::run_manual_job_with_runtime(
             &self.config,
             &job,
@@ -144,6 +172,20 @@ impl Tool for CronRunTool {
             approved,
         )
         .await;
+
+        if let Err(e) = cron::release_job(&self.config, &job.id) {
+            ::zeroclaw_log::record!(
+                WARN,
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                    .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
+                    .with_attrs(::serde_json::json!({
+                        "job_id": job.id,
+                        "agent_alias": self.agent_alias,
+                        "error": format!("{e}")
+                    })),
+                "agent cron_run: failed to release in-flight lock after run"
+            );
+        }
 
         Ok(ToolResult {
             success: result.success,
@@ -242,6 +284,29 @@ mod tests {
 
         let runs = cron::list_runs(&cfg, &job.id, 10).unwrap();
         assert_eq!(runs.len(), 1);
+        assert!(cron::claim_job_for_agent(&cfg, &job.id, TEST_AGENT, chrono::Utc::now()).unwrap());
+        cron::release_job(&cfg, &job.id).unwrap();
+    }
+
+    #[tokio::test]
+    async fn refuses_to_run_a_job_after_ownership_moves() {
+        let tmp = TempDir::new().unwrap();
+        let mut config = Config {
+            data_dir: tmp.path().join("data"),
+            config_path: tmp.path().join("config.toml"),
+            ..Config::default()
+        };
+        seed_test_agent(&mut config);
+        tokio::fs::create_dir_all(&config.data_dir).await.unwrap();
+        let job = cron::add_job(&config, TEST_AGENT, "*/5 * * * *", "echo run-now").unwrap();
+        cron::rename_jobs_by_agent(&config, TEST_AGENT, "new-owner").unwrap();
+        let cfg = Arc::new(config);
+        let tool = CronRunTool::new(cfg.clone(), test_security(&cfg));
+
+        let result = tool.execute(json!({ "job_id": job.id })).await.unwrap();
+        assert!(!result.success);
+        assert!(result.error.unwrap_or_default().contains("not found"));
+        assert!(cron::list_runs(&cfg, &job.id, 10).unwrap().is_empty());
     }
 
     #[tokio::test]

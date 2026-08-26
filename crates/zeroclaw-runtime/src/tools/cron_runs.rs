@@ -10,11 +10,15 @@ const MAX_RUN_OUTPUT_CHARS: usize = 500;
 
 pub struct CronRunsTool {
     config: Arc<Config>,
+    agent_alias: String,
 }
 
 impl CronRunsTool {
-    pub fn new(config: Arc<Config>) -> Self {
-        Self { config }
+    pub fn new(config: Arc<Config>, agent_alias: impl Into<String>) -> Self {
+        Self {
+            config,
+            agent_alias: agent_alias.into(),
+        }
     }
 }
 
@@ -59,7 +63,7 @@ impl Tool for CronRunsTool {
             });
         }
 
-        let job_id = match args.get("job_id").and_then(serde_json::Value::as_str) {
+        let raw_job_id = match args.get("job_id").and_then(serde_json::Value::as_str) {
             Some(v) if !v.trim().is_empty() => v,
             _ => {
                 return Ok(ToolResult {
@@ -75,7 +79,18 @@ impl Tool for CronRunsTool {
             .and_then(serde_json::Value::as_u64)
             .map_or(10, |v| usize::try_from(v).unwrap_or(10));
 
-        match cron::list_runs(&self.config, job_id, limit) {
+        let job_id = match cron::get_job_for_agent(&self.config, raw_job_id, &self.agent_alias) {
+            Ok(job) => job.id,
+            Err(e) => {
+                return Ok(ToolResult {
+                    success: false,
+                    output: ToolOutput::default(),
+                    error: Some(e.to_string()),
+                });
+            }
+        };
+
+        match cron::list_runs_for_agent(&self.config, &job_id, &self.agent_alias, limit) {
             Ok(runs) => {
                 let runs: Vec<RunView> = runs
                     .into_iter()
@@ -173,7 +188,7 @@ mod tests {
         )
         .unwrap();
 
-        let tool = CronRunsTool::new(cfg.clone());
+        let tool = CronRunsTool::new(cfg.clone(), TEST_AGENT);
         let result = tool
             .execute(json!({ "job_id": job.id, "limit": 5 }))
             .await
@@ -187,7 +202,7 @@ mod tests {
     async fn errors_when_job_id_missing() {
         let tmp = TempDir::new().unwrap();
         let cfg = test_config(&tmp).await;
-        let tool = CronRunsTool::new(cfg);
+        let tool = CronRunsTool::new(cfg, TEST_AGENT);
         let result = tool.execute(json!({})).await.unwrap();
         assert!(!result.success);
         assert!(
@@ -196,5 +211,23 @@ mod tests {
                 .unwrap_or_default()
                 .contains("Missing 'job_id'")
         );
+    }
+
+    #[tokio::test]
+    async fn refuses_to_read_another_agents_run_history() {
+        let tmp = TempDir::new().unwrap();
+        let cfg = test_config(&tmp).await;
+        let job = cron::add_job(&cfg, TEST_AGENT, "*/5 * * * *", "echo private").unwrap();
+        let now = Utc::now();
+        cron::record_run(&cfg, &job.id, now, now, "ok", Some("private output"), 0).unwrap();
+
+        let tool = CronRunsTool::new(cfg, "other-agent");
+        let result = tool
+            .execute(json!({ "job_id": job.id, "limit": 5 }))
+            .await
+            .unwrap();
+
+        assert!(!result.success);
+        assert!(result.error.unwrap_or_default().contains("not found"));
     }
 }

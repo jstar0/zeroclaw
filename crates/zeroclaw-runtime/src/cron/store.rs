@@ -227,6 +227,33 @@ pub fn get_job(config: &Config, job_id: &str) -> Result<CronJob> {
     Ok(job)
 }
 
+/// Read a job only when `agent_alias` is its current owner. The ownership
+/// predicate belongs to this SELECT so an operator rename that commits before
+/// the read cannot leave the caller with a stale authorization.
+pub fn get_job_for_agent(config: &Config, job_id: &str, agent_alias: &str) -> Result<CronJob> {
+    let Some(mut job) = with_read_connection(config, |conn| {
+        let mut stmt = conn.prepare(
+            "SELECT id, expression, command, schedule, job_type, prompt, name, session_target, model,
+                     enabled, delivery, delete_after_run, created_at, next_run, last_run, last_status, last_output,
+                     allowed_tools, source, uses_memory, agent_alias, shell_output_format
+             FROM cron_jobs WHERE id = ?1 AND agent_alias = ?2",
+        )?;
+
+        let mut rows = stmt.query(params![job_id, agent_alias])?;
+        if let Some(row) = rows.next()? {
+            map_cron_job_row(row).map_err(Into::into)
+        } else {
+            anyhow::bail!("Cron job '{job_id}' not found")
+        }
+    })?
+    else {
+        anyhow::bail!("Cron job '{job_id}' not found")
+    };
+
+    resolve_declarative_shell_output_format(config, &mut job);
+    Ok(job)
+}
+
 /// Raw DB row for a job, with no config overlay applied. `shell_output_format`
 /// on the returned job is exactly what's stored in the `cron_jobs` column —
 /// for a declarative job that is a stale/default value, not the canonical
@@ -745,6 +772,30 @@ pub fn claim_job(config: &Config, job_id: &str, now: DateTime<Utc>) -> Result<bo
     })
 }
 
+/// Claim a job only while it is still owned by `agent_alias`.
+///
+/// The owner predicate is part of the atomic claim update. This is the
+/// linearization point for an agent-facing manual trigger: a rename that wins
+/// before this statement prevents the former owner from executing the job.
+pub fn claim_job_for_agent(
+    config: &Config,
+    job_id: &str,
+    agent_alias: &str,
+    now: DateTime<Utc>,
+) -> Result<bool> {
+    with_initialized_connection(config, |conn| {
+        let claimed = conn
+            .execute(
+                "UPDATE cron_jobs
+                 SET locked_at = ?1
+                 WHERE id = ?2 AND agent_alias = ?3 AND locked_at IS NULL",
+                params![now.to_rfc3339(), job_id, agent_alias],
+            )
+            .context("Failed to claim agent-owned cron job for execution")?;
+        Ok(claimed == 1)
+    })
+}
+
 pub fn release_job(config: &Config, job_id: &str) -> Result<()> {
     with_initialized_connection(config, |conn| {
         conn.execute(
@@ -986,6 +1037,55 @@ pub fn list_runs(config: &Config, job_id: &str, limit: usize) -> Result<Vec<Cron
         )?;
 
         let rows = stmt.query_map(params![job_id, lim], |row| {
+            Ok(CronRun {
+                id: row.get(0)?,
+                job_id: row.get(1)?,
+                started_at: parse_rfc3339(&row.get::<_, String>(2)?)
+                    .map_err(sql_conversion_error)?,
+                finished_at: parse_rfc3339(&row.get::<_, String>(3)?)
+                    .map_err(sql_conversion_error)?,
+                status: row.get(4)?,
+                output: row.get(5)?,
+                duration_ms: row.get(6)?,
+            })
+        })?;
+
+        let mut runs = Vec::new();
+        for row in rows {
+            runs.push(row?);
+        }
+        Ok(runs)
+    })?
+    else {
+        return Ok(Vec::new());
+    };
+
+    Ok(runs)
+}
+
+/// List run history only while the job is owned by `agent_alias`.
+///
+/// Joining the owner row in the same SELECT keeps the authorization predicate
+/// at the history-read boundary. A rename committed before this statement
+/// therefore returns no history to the former owner.
+pub fn list_runs_for_agent(
+    config: &Config,
+    job_id: &str,
+    agent_alias: &str,
+    limit: usize,
+) -> Result<Vec<CronRun>> {
+    let Some(runs) = with_read_connection(config, |conn| {
+        let lim = i64::try_from(limit.max(1)).context("Run history limit overflow")?;
+        let mut stmt = conn.prepare(
+            "SELECT r.id, r.job_id, r.started_at, r.finished_at, r.status, r.output, r.duration_ms
+             FROM cron_runs AS r
+             INNER JOIN cron_jobs AS j ON j.id = r.job_id
+             WHERE r.job_id = ?1 AND j.agent_alias = ?2
+             ORDER BY r.started_at DESC, r.id DESC
+             LIMIT ?3",
+        )?;
+
+        let rows = stmt.query_map(params![job_id, agent_alias, lim], |row| {
             Ok(CronRun {
                 id: row.get(0)?,
                 job_id: row.get(1)?,
@@ -1840,6 +1940,58 @@ mod tests {
         assert!(
             claim_job(&config, &job.id, now).unwrap(),
             "claim should win again after release"
+        );
+    }
+
+    #[test]
+    fn agent_claim_rechecks_owner_at_the_claim_boundary() {
+        let tmp = TempDir::new().unwrap();
+        let config = test_config(&tmp);
+        let job = add_job(&config, "owner-agent", "*/5 * * * *", "echo ok").unwrap();
+
+        // Simulate a successful scoped authorization followed by the operator's
+        // rename before the effect. The guarded UPDATE must reject the stale owner.
+        assert_eq!(
+            get_job_for_agent(&config, &job.id, "owner-agent")
+                .unwrap()
+                .agent_alias,
+            "owner-agent"
+        );
+        rename_jobs_by_agent(&config, "owner-agent", "new-owner").unwrap();
+
+        let now = Utc::now();
+        assert!(!claim_job_for_agent(&config, &job.id, "owner-agent", now).unwrap());
+        assert!(claim_job_for_agent(&config, &job.id, "new-owner", now).unwrap());
+        assert!(!claim_job_for_agent(&config, &job.id, "new-owner", now).unwrap());
+        release_job(&config, &job.id).unwrap();
+    }
+
+    #[test]
+    fn agent_run_history_rechecks_owner_in_the_history_query() {
+        let tmp = TempDir::new().unwrap();
+        let config = test_config(&tmp);
+        let job = add_job(&config, "owner-agent", "*/5 * * * *", "echo ok").unwrap();
+        let now = Utc::now();
+        record_run(&config, &job.id, now, now, "ok", Some("private output"), 0).unwrap();
+
+        assert_eq!(
+            list_runs_for_agent(&config, &job.id, "owner-agent", 10)
+                .unwrap()
+                .len(),
+            1
+        );
+        rename_jobs_by_agent(&config, "owner-agent", "new-owner").unwrap();
+
+        assert!(
+            list_runs_for_agent(&config, &job.id, "owner-agent", 10)
+                .unwrap()
+                .is_empty()
+        );
+        assert_eq!(
+            list_runs_for_agent(&config, &job.id, "new-owner", 10)
+                .unwrap()
+                .len(),
+            1
         );
     }
 
