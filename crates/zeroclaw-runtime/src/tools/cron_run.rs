@@ -18,15 +18,17 @@ struct ManualCronClaim {
     config: Arc<Config>,
     job_id: String,
     agent_alias: String,
+    lock_token: String,
     released: bool,
 }
 
 impl ManualCronClaim {
-    fn new(config: Arc<Config>, job_id: String, agent_alias: String) -> Self {
+    fn new(config: Arc<Config>, job_id: String, agent_alias: String, lock_token: String) -> Self {
         Self {
             config,
             job_id,
             agent_alias,
+            lock_token,
             released: false,
         }
     }
@@ -36,8 +38,8 @@ impl ManualCronClaim {
             return;
         }
 
-        match cron::release_job(&self.config, &self.job_id) {
-            Ok(()) => self.released = true,
+        match cron::release_job_for_token(&self.config, &self.job_id, &self.lock_token) {
+            Ok(_) => self.released = true,
             Err(e) => ::zeroclaw_log::record!(
                 WARN,
                 ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
@@ -185,13 +187,13 @@ impl Tool for CronRunTool {
             });
         }
 
-        let claimed = match cron::claim_job_for_agent(
+        let lock_token = match cron::claim_job_for_agent_with_token(
             &self.config,
             &job.id,
             &self.agent_alias,
             chrono::Utc::now(),
         ) {
-            Ok(claimed) => claimed,
+            Ok(lock_token) => lock_token,
             Err(e) => {
                 return Ok(ToolResult {
                     success: false,
@@ -200,7 +202,7 @@ impl Tool for CronRunTool {
                 });
             }
         };
-        if !claimed {
+        let Some(lock_token) = lock_token else {
             return Ok(ToolResult {
                 success: false,
                 output: ToolOutput::default(),
@@ -208,12 +210,13 @@ impl Tool for CronRunTool {
                     "Cron job '{job_id}' not found or is already in flight"
                 )),
             });
-        }
+        };
 
         let mut claim = ManualCronClaim::new(
             self.config.clone(),
             job.id.clone(),
             self.agent_alias.clone(),
+            lock_token,
         );
         let result = cron::scheduler::run_manual_job_with_runtime(
             &self.config,

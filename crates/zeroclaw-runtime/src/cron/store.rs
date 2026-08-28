@@ -6,11 +6,22 @@ use anyhow::{Context, Result};
 use chrono::{DateTime, Utc};
 use rusqlite::types::{FromSqlResult, ValueRef};
 use rusqlite::{Connection, OpenFlags, params};
+use std::sync::OnceLock;
 use uuid::Uuid;
 use zeroclaw_config::schema::{Config, CronShellOutputFormat};
 
 const MAX_CRON_OUTPUT_BYTES: usize = 16 * 1024;
 const TRUNCATED_OUTPUT_MARKER: &str = "\n...[truncated]";
+
+static CRON_PROCESS_LOCK_OWNER: OnceLock<String> = OnceLock::new();
+
+fn cron_process_lock_owner() -> &'static str {
+    CRON_PROCESS_LOCK_OWNER.get_or_init(|| Uuid::new_v4().to_string())
+}
+
+fn new_agent_lock_token() -> String {
+    format!("{}:{}", cron_process_lock_owner(), Uuid::new_v4())
+}
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum RunCompletionAction {
@@ -783,23 +794,56 @@ pub fn claim_job_for_agent(
     agent_alias: &str,
     now: DateTime<Utc>,
 ) -> Result<bool> {
+    Ok(claim_job_for_agent_with_token(config, job_id, agent_alias, now)?.is_some())
+}
+
+/// Claim an agent-owned job and return the opaque claim token.
+///
+/// The token identifies this specific execution. It lets cleanup release only
+/// the claim it acquired, so a cancelled run cannot clear a later execution's
+/// lock for the same job.
+pub fn claim_job_for_agent_with_token(
+    config: &Config,
+    job_id: &str,
+    agent_alias: &str,
+    now: DateTime<Utc>,
+) -> Result<Option<String>> {
+    let lock_token = new_agent_lock_token();
     with_initialized_connection(config, |conn| {
         let claimed = conn
             .execute(
                 "UPDATE cron_jobs
-                 SET locked_at = ?1
-                 WHERE id = ?2 AND agent_alias = ?3 AND locked_at IS NULL",
-                params![now.to_rfc3339(), job_id, agent_alias],
+                 SET locked_at = ?1, lock_token = ?2
+                 WHERE id = ?3 AND agent_alias = ?4 AND locked_at IS NULL",
+                params![now.to_rfc3339(), lock_token, job_id, agent_alias],
             )
             .context("Failed to claim agent-owned cron job for execution")?;
-        Ok(claimed == 1)
+        Ok(if claimed == 1 {
+            Some(lock_token.clone())
+        } else {
+            None
+        })
     })
+}
+
+/// Release an agent claim only when it still owns the supplied token.
+pub fn release_job_for_token(config: &Config, job_id: &str, lock_token: &str) -> Result<bool> {
+    let changed = with_initialized_connection(config, |conn| {
+        conn.execute(
+            "UPDATE cron_jobs
+             SET locked_at = NULL, lock_token = NULL
+             WHERE id = ?1 AND lock_token = ?2",
+            params![job_id, lock_token],
+        )
+        .context("Failed to release cron job lock")
+    })?;
+    Ok(changed == 1)
 }
 
 pub fn release_job(config: &Config, job_id: &str) -> Result<()> {
     with_initialized_connection(config, |conn| {
         conn.execute(
-            "UPDATE cron_jobs SET locked_at = NULL WHERE id = ?1",
+            "UPDATE cron_jobs SET locked_at = NULL, lock_token = NULL WHERE id = ?1",
             params![job_id],
         )
         .context("Failed to release cron job lock")?;
@@ -808,10 +852,14 @@ pub fn release_job(config: &Config, job_id: &str) -> Result<()> {
 }
 
 pub fn clear_stale_locks(config: &Config) -> Result<usize> {
+    let current_owner = format!("{}:%", cron_process_lock_owner());
     let cleared = with_read_connection(config, |conn| {
         conn.execute(
-            "UPDATE cron_jobs SET locked_at = NULL WHERE locked_at IS NOT NULL",
-            [],
+            "UPDATE cron_jobs
+             SET locked_at = NULL, lock_token = NULL
+             WHERE locked_at IS NOT NULL
+               AND (lock_token IS NULL OR lock_token NOT LIKE ?1)",
+            params![current_owner],
         )
         .context("Failed to clear stale cron job locks")
     })?;
@@ -1806,6 +1854,10 @@ fn initialize_schema(conn: &Connection) -> Result<()> {
     // runs longer than the poll interval cannot be launched again while still in
     // flight (see `claim_job`/`release_job` and
     add_column_if_missing(conn, "locked_at", "TEXT")?;
+    // Agent-triggered claims also carry an opaque per-execution token. The
+    // process prefix lets startup recovery distinguish this process's live
+    // claims from locks left by a previous process.
+    add_column_if_missing(conn, "lock_token", "TEXT")?;
     add_column_if_missing(
         conn,
         "shell_output_format",
@@ -1964,6 +2016,41 @@ mod tests {
         assert!(claim_job_for_agent(&config, &job.id, "new-owner", now).unwrap());
         assert!(!claim_job_for_agent(&config, &job.id, "new-owner", now).unwrap());
         release_job(&config, &job.id).unwrap();
+    }
+
+    #[test]
+    fn agent_claim_token_prevents_late_release_from_clearing_replacement() {
+        let tmp = TempDir::new().unwrap();
+        let config = test_config(&tmp);
+        let job = add_job(&config, "owner-agent", "*/5 * * * *", "echo ok").unwrap();
+        let now = Utc::now();
+
+        let first = claim_job_for_agent_with_token(&config, &job.id, "owner-agent", now)
+            .unwrap()
+            .expect("first claim should win");
+        release_job_for_token(&config, &job.id, &first).unwrap();
+
+        let second = claim_job_for_agent_with_token(&config, &job.id, "owner-agent", now)
+            .unwrap()
+            .expect("replacement claim should win");
+        assert!(!release_job_for_token(&config, &job.id, &first).unwrap());
+        assert!(due_jobs(&config, now).unwrap().is_empty());
+        assert!(release_job_for_token(&config, &job.id, &second).unwrap());
+    }
+
+    #[test]
+    fn clear_stale_locks_preserves_current_process_agent_claim() {
+        let tmp = TempDir::new().unwrap();
+        let config = test_config(&tmp);
+        let job = add_job(&config, "owner-agent", "*/5 * * * *", "echo ok").unwrap();
+        let now = Utc::now();
+
+        let token = claim_job_for_agent_with_token(&config, &job.id, "owner-agent", now)
+            .unwrap()
+            .expect("agent claim should win");
+        assert_eq!(clear_stale_locks(&config).unwrap(), 0);
+        assert!(due_jobs(&config, now).unwrap().is_empty());
+        assert!(release_job_for_token(&config, &job.id, &token).unwrap());
     }
 
     #[test]
