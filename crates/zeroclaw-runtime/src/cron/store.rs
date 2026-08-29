@@ -6,7 +6,8 @@ use anyhow::{Context, Result};
 use chrono::{DateTime, Utc};
 use rusqlite::types::{FromSqlResult, ValueRef};
 use rusqlite::{Connection, OpenFlags, params};
-use std::sync::OnceLock;
+use std::collections::HashSet;
+use std::sync::{LazyLock, Mutex, OnceLock};
 use uuid::Uuid;
 use zeroclaw_config::schema::{Config, CronShellOutputFormat};
 
@@ -15,12 +16,77 @@ const TRUNCATED_OUTPUT_MARKER: &str = "\n...[truncated]";
 
 static CRON_PROCESS_LOCK_OWNER: OnceLock<String> = OnceLock::new();
 
+// A process-owned token is only safe to preserve during startup recovery while
+// its manual-run guard is still alive. The database cannot represent that
+// distinction, so keep the live set in process memory and fail closed for any
+// current-process token whose guard has terminated.
+static LIVE_AGENT_CLAIM_TOKENS: LazyLock<Mutex<HashSet<(std::path::PathBuf, String, String)>>> =
+    LazyLock::new(|| Mutex::new(HashSet::new()));
+
+#[cfg(test)]
+static FORCED_RELEASE_FAILURES: LazyLock<Mutex<HashSet<std::path::PathBuf>>> =
+    LazyLock::new(|| Mutex::new(HashSet::new()));
+
 fn cron_process_lock_owner() -> &'static str {
     CRON_PROCESS_LOCK_OWNER.get_or_init(|| Uuid::new_v4().to_string())
 }
 
 fn new_agent_lock_token() -> String {
     format!("{}:{}", cron_process_lock_owner(), Uuid::new_v4())
+}
+
+fn register_live_agent_claim(config: &Config, job_id: &str, lock_token: &str) {
+    let mut claims = LIVE_AGENT_CLAIM_TOKENS
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    claims.insert((
+        cron_db_path(config),
+        job_id.to_string(),
+        lock_token.to_string(),
+    ));
+}
+
+pub(crate) fn finish_agent_claim(config: &Config, job_id: &str, lock_token: &str) {
+    let mut claims = LIVE_AGENT_CLAIM_TOKENS
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    claims.remove(&(
+        cron_db_path(config),
+        job_id.to_string(),
+        lock_token.to_string(),
+    ));
+}
+
+fn live_agent_claim_tokens(config: &Config) -> HashSet<String> {
+    let claims = LIVE_AGENT_CLAIM_TOKENS
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    let db_path = cron_db_path(config);
+    claims
+        .iter()
+        .filter_map(|(path, _, token)| (path == &db_path).then_some(token.clone()))
+        .collect()
+}
+
+#[cfg(test)]
+pub(crate) fn force_release_failure_for_tests(config: &Config, enabled: bool) {
+    let mut failures = FORCED_RELEASE_FAILURES
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    let db_path = cron_db_path(config);
+    if enabled {
+        failures.insert(db_path);
+    } else {
+        failures.remove(&db_path);
+    }
+}
+
+#[cfg(test)]
+fn should_force_release_failure(config: &Config) -> bool {
+    FORCED_RELEASE_FAILURES
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .contains(&cron_db_path(config))
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -794,7 +860,13 @@ pub fn claim_job_for_agent(
     agent_alias: &str,
     now: DateTime<Utc>,
 ) -> Result<bool> {
-    Ok(claim_job_for_agent_with_token(config, job_id, agent_alias, now)?.is_some())
+    let token = claim_job_for_agent_with_token(config, job_id, agent_alias, now)?;
+    if let Some(token) = token.as_deref() {
+        // This compatibility wrapper cannot own a guard, so it must not leave
+        // a token marked live beyond the claim operation itself.
+        finish_agent_claim(config, job_id, token);
+    }
+    Ok(token.is_some())
 }
 
 /// Claim an agent-owned job and return the opaque claim token.
@@ -809,7 +881,8 @@ pub fn claim_job_for_agent_with_token(
     now: DateTime<Utc>,
 ) -> Result<Option<String>> {
     let lock_token = new_agent_lock_token();
-    with_initialized_connection(config, |conn| {
+    register_live_agent_claim(config, job_id, &lock_token);
+    let result = with_initialized_connection(config, |conn| {
         let claimed = conn
             .execute(
                 "UPDATE cron_jobs
@@ -823,11 +896,27 @@ pub fn claim_job_for_agent_with_token(
         } else {
             None
         })
-    })
+    });
+    match result {
+        Ok(Some(token)) => Ok(Some(token)),
+        Ok(None) => {
+            finish_agent_claim(config, job_id, &lock_token);
+            Ok(None)
+        }
+        Err(error) => {
+            finish_agent_claim(config, job_id, &lock_token);
+            Err(error)
+        }
+    }
 }
 
 /// Release an agent claim only when it still owns the supplied token.
 pub fn release_job_for_token(config: &Config, job_id: &str, lock_token: &str) -> Result<bool> {
+    #[cfg(test)]
+    if should_force_release_failure(config) {
+        anyhow::bail!("forced cron lock release failure for test");
+    }
+
     let changed = with_initialized_connection(config, |conn| {
         conn.execute(
             "UPDATE cron_jobs
@@ -837,6 +926,9 @@ pub fn release_job_for_token(config: &Config, job_id: &str, lock_token: &str) ->
         )
         .context("Failed to release cron job lock")
     })?;
+    if changed == 1 {
+        finish_agent_claim(config, job_id, lock_token);
+    }
     Ok(changed == 1)
 }
 
@@ -852,16 +944,28 @@ pub fn release_job(config: &Config, job_id: &str) -> Result<()> {
 }
 
 pub fn clear_stale_locks(config: &Config) -> Result<usize> {
-    let current_owner = format!("{}:%", cron_process_lock_owner());
+    let live_tokens = live_agent_claim_tokens(config);
     let cleared = with_read_connection(config, |conn| {
-        conn.execute(
-            "UPDATE cron_jobs
-             SET locked_at = NULL, lock_token = NULL
-             WHERE locked_at IS NOT NULL
-               AND (lock_token IS NULL OR lock_token NOT LIKE ?1)",
-            params![current_owner],
-        )
-        .context("Failed to clear stale cron job locks")
+        let changed = if live_tokens.is_empty() {
+            conn.execute(
+                "UPDATE cron_jobs
+                 SET locked_at = NULL, lock_token = NULL
+                 WHERE locked_at IS NOT NULL",
+                [],
+            )?
+        } else {
+            let placeholders = std::iter::repeat_n("?", live_tokens.len())
+                .collect::<Vec<_>>()
+                .join(", ");
+            let sql = format!(
+                "UPDATE cron_jobs
+                 SET locked_at = NULL, lock_token = NULL
+                 WHERE locked_at IS NOT NULL
+                   AND (lock_token IS NULL OR lock_token NOT IN ({placeholders}))"
+            );
+            conn.execute(&sql, rusqlite::params_from_iter(live_tokens.iter()))?
+        };
+        Ok(changed)
     })?;
     Ok(cleared.unwrap_or(0))
 }
@@ -1854,9 +1958,9 @@ fn initialize_schema(conn: &Connection) -> Result<()> {
     // runs longer than the poll interval cannot be launched again while still in
     // flight (see `claim_job`/`release_job` and
     add_column_if_missing(conn, "locked_at", "TEXT")?;
-    // Agent-triggered claims also carry an opaque per-execution token. The
-    // process prefix lets startup recovery distinguish this process's live
-    // claims from locks left by a previous process.
+    // Agent-triggered claims also carry an opaque per-execution token. Startup
+    // recovery preserves only tokens whose manual-run guards are still live in
+    // this process; all other locks are eligible for cleanup.
     add_column_if_missing(conn, "lock_token", "TEXT")?;
     add_column_if_missing(
         conn,

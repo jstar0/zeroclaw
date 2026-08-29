@@ -52,6 +52,10 @@ impl ManualCronClaim {
                 "agent cron_run: failed to release in-flight lock"
             ),
         }
+        // Once the manual run has finished (or cancellation has dropped this
+        // guard), recovery must be allowed to clear the token even if both
+        // release attempts fail.
+        cron::finish_agent_claim(&self.config, &self.job_id, &self.lock_token);
     }
 }
 
@@ -432,6 +436,47 @@ mod tests {
             "a cancelled manual run must not leave its job locked"
         );
         cron::release_job(&cfg, &job.id).unwrap();
+    }
+
+    #[test]
+    fn failed_manual_claim_release_is_recovered_in_the_same_process() {
+        let tmp = TempDir::new().unwrap();
+        let mut config = Config {
+            data_dir: tmp.path().join("data"),
+            config_path: tmp.path().join("config.toml"),
+            ..Config::default()
+        };
+        seed_test_agent(&mut config);
+        std::fs::create_dir_all(&config.data_dir).unwrap();
+        let job =
+            cron::add_job(&config, TEST_AGENT, "*/5 * * * *", "echo release-failure").unwrap();
+        let config = Arc::new(config);
+        let lock_token =
+            cron::claim_job_for_agent_with_token(&config, &job.id, TEST_AGENT, chrono::Utc::now())
+                .unwrap()
+                .expect("manual claim should succeed");
+
+        cron::force_release_failure_for_tests(&config, true);
+        let mut claim = ManualCronClaim::new(
+            config.clone(),
+            job.id.clone(),
+            TEST_AGENT.to_string(),
+            lock_token,
+        );
+        claim.release();
+        drop(claim);
+        cron::force_release_failure_for_tests(&config, false);
+
+        assert_eq!(
+            cron::clear_stale_locks(&config).unwrap(),
+            1,
+            "same-process recovery must clear a terminated manual claim after release failure"
+        );
+        assert!(
+            cron::claim_job_for_agent(&config, &job.id, TEST_AGENT, chrono::Utc::now()).unwrap(),
+            "the recovered job must be claimable again"
+        );
+        cron::release_job(&config, &job.id).unwrap();
     }
 
     #[tokio::test]
