@@ -706,6 +706,35 @@ impl EdgeTtsProvider {
     }
 }
 
+impl EdgeTtsProvider {
+    /// Pre-create the media artifact with owner-only permissions (0o600) on Unix.
+    ///
+    /// Left to the edge-tts subprocess, the media file is created with
+    /// umask-affected defaults (typically 0o644), which exposes synthesized
+    /// audio to other users on shared hosts. Creating the file first means the
+    /// child truncates and writes into an existing owner-only file.
+    /// ``create_new`` also makes a UUID collision fail loudly instead of
+    /// clobbering another artifact.
+    fn create_owner_only_artifact(path: &std::path::Path) -> Result<()> {
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+
+            std::fs::OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .mode(0o600)
+                .open(path)
+                .context("Failed to create Edge TTS artifact with owner-only permissions")?;
+        }
+        #[cfg(not(unix))]
+        {
+            let _ = path;
+        }
+        Ok(())
+    }
+}
+
 #[async_trait::async_trait]
 impl TtsProvider for EdgeTtsProvider {
     fn name(&self) -> &str {
@@ -722,6 +751,7 @@ impl TtsProvider for EdgeTtsProvider {
         let output_path = output_file
             .to_str()
             .context("Failed to build temp file path for Edge TTS")?;
+        Self::create_owner_only_artifact(&output_file)?;
 
         // Spawn explicitly and move the child into the artifact guard, which
         // owns the child through timeout handling AND cancellation: on any path
@@ -1284,6 +1314,28 @@ mod tests {
             .status()
             .await
             .is_ok_and(|status| status.success())
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn edge_tts_artifact_is_created_owner_only() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let path =
+            std::env::temp_dir().join(format!("zeroclaw_tts_perm_{}.mp3", uuid::Uuid::new_v4()));
+
+        EdgeTtsProvider::create_owner_only_artifact(&path).unwrap();
+        let mode = std::fs::metadata(&path).unwrap().permissions().mode();
+        assert_eq!(
+            mode & 0o777,
+            0o600,
+            "Edge TTS artifact must be owner-only before the subprocess writes it"
+        );
+
+        // A collision fails loudly instead of clobbering an existing artifact.
+        assert!(EdgeTtsProvider::create_owner_only_artifact(&path).is_err());
+
+        let _ = std::fs::remove_file(&path);
     }
 
     #[cfg(unix)]
