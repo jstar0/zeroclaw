@@ -198,7 +198,7 @@ pub async fn handle_ws_chat(
 }
 
 /// Gateway session key prefix to avoid collisions with channel sessions.
-const GW_SESSION_PREFIX: &str = "gw_";
+pub(crate) const GW_SESSION_PREFIX: &str = "gw_";
 
 fn websocket_ping_interval(
     config: &zeroclaw_config::schema::Config,

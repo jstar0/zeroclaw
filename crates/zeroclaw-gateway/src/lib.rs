@@ -78,7 +78,10 @@ use axum::{
     Router,
     extract::{ConnectInfo, Query, State},
     http::{HeaderMap, StatusCode, header},
-    response::{IntoResponse, Json},
+    response::{
+        IntoResponse, Json, Response,
+        sse::{Event as SseWireEvent, KeepAlive as SseKeepAlive, Sse as SseBody},
+    },
     routing::{delete, get, post, put},
 };
 use parking_lot::{Mutex, RwLock};
@@ -86,6 +89,7 @@ use std::collections::HashMap;
 use std::net::{IpAddr, SocketAddr};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
+use ws::GW_SESSION_PREFIX;
 
 /// Backoff after a transient `accept()` error so the serve loop does not
 /// hot-spin while the condition (e.g. fd exhaustion) clears.
@@ -2647,6 +2651,10 @@ fn sop_webhook_routes() -> Router<AppState> {
 #[derive(serde::Deserialize)]
 pub struct WebhookBody {
     pub message: String,
+    /// Opt in to Server-Sent Events streaming for this turn (requires an
+    /// `Accept: text/event-stream` header as well). See #10419.
+    #[serde(default)]
+    pub stream: bool,
 }
 
 /// Webhook query parameters
@@ -2925,10 +2933,10 @@ async fn handle_webhook(
     Query(query): Query<WebhookQuery>,
     headers: HeaderMap,
     body: Result<Json<WebhookBody>, axum::extract::rejection::JsonRejection>,
-) -> impl IntoResponse {
+) -> Response {
     let auth_verdict = match authorize_webhook_request(&state, peer_addr, &headers) {
         Ok(verdict) => verdict,
-        Err(response) => return response,
+        Err(response) => return response.into_response(),
     };
     let Json(webhook_body) = match body {
         Ok(b) => b,
@@ -2943,7 +2951,7 @@ async fn handle_webhook(
             let err = serde_json::json!({
                 "error": "Invalid JSON body. Expected: {\"message\": \"...\"}"
             });
-            return (StatusCode::BAD_REQUEST, Json(err));
+            return (StatusCode::BAD_REQUEST, Json(err)).into_response();
         }
     };
 
@@ -2955,20 +2963,20 @@ async fn handle_webhook(
     let sop_payload = serde_json::json!({ "message": &webhook_body.message }).to_string();
     let has_matching_sop = match api_sop_webhook::has_matching_webhook_sop(&state, "/webhook") {
         Ok(matches) => matches,
-        Err(response) => return response,
+        Err(response) => return response.into_response(),
     };
 
     if has_matching_sop {
         if let Err(response) = require_sop_dispatch_credentials(auth_verdict) {
-            return response;
+            return response.into_response();
         }
         if let Some(response) = check_webhook_idempotency(&state, &headers, None) {
-            return response;
+            return response.into_response();
         }
         if let api_sop_webhook::SopWebhookOutcome::Handled(response) =
             api_sop_webhook::dispatch_webhook_sop(&state, "/webhook", Some(&sop_payload)).await
         {
-            return response;
+            return response.into_response();
         }
         // The engine reported no match after all (e.g. a trigger was
         // unloaded between the pre-check above and dispatch); fall through
@@ -3002,12 +3010,12 @@ async fn handle_webhook(
                     "Unknown agent `{alias}` — no [agents.{alias}] entry configured."
                 )
             });
-            return (StatusCode::BAD_REQUEST, Json(err));
+            return (StatusCode::BAD_REQUEST, Json(err)).into_response();
         }
     }
 
     if !has_matching_sop && let Some(response) = check_webhook_idempotency(&state, &headers, None) {
-        return response;
+        return response.into_response();
     }
 
     let message = &webhook_body.message;
@@ -3050,6 +3058,23 @@ async fn handle_webhook(
     // gives one webhook prompt two unrelated turn IDs.
     let started_at = Instant::now();
 
+    // ── Optional SSE streaming (#10419) ──
+    // Opt in with `stream: true` plus an `Accept: text/event-stream` header:
+    // the turn then streams cumulative assistant tokens as `event: token`
+    // frames, ends with `event: done` (or `event: error`), and honours
+    // client disconnects through the shared cancellation registry. Every
+    // other combination keeps the JSON `{ response }` path below untouched.
+    if webhook_body.stream && accepts_sse(&headers) {
+        return run_gateway_chat_streaming_response(
+            &state,
+            message,
+            session_id.as_deref(),
+            agent_override,
+            started_at,
+        )
+        .await;
+    }
+
     match run_gateway_chat_with_tools(&state, message, session_id.as_deref(), agent_override).await
     {
         Ok(GatewayChatOutcome { response, .. }) => {
@@ -3060,6 +3085,9 @@ async fn handle_webhook(
 
             let body = serde_json::json!({"response": response, "model": model_label});
             (StatusCode::OK, Json(body))
+                .into_response()
+                .into_response()
+                .into_response()
         }
         Err(e) => {
             let duration = started_at.elapsed();
@@ -3086,6 +3114,9 @@ async fn handle_webhook(
                     "url": "/quickstart"
                 });
                 (StatusCode::SERVICE_UNAVAILABLE, Json(body))
+                    .into_response()
+                    .into_response()
+                    .into_response()
             } else {
                 ::zeroclaw_log::record!(
                     ERROR,
@@ -3096,8 +3127,230 @@ async fn handle_webhook(
                 );
                 let err = serde_json::json!({"error": "LLM request failed"});
                 (StatusCode::INTERNAL_SERVER_ERROR, Json(err))
+                    .into_response()
+                    .into_response()
+                    .into_response()
             }
         }
+    }
+}
+
+/// True when the request's `Accept` header negotiates Server-Sent Events.
+fn accepts_sse(headers: &HeaderMap) -> bool {
+    headers
+        .get(header::ACCEPT)
+        .and_then(|v| v.to_str().ok())
+        .map(|v| v.to_ascii_lowercase().contains("text/event-stream"))
+        .unwrap_or(false)
+}
+
+/// Build one cumulative `event: token` SSE frame.
+fn sse_token_frame(cumulative: &str) -> Result<SseWireEvent, std::convert::Infallible> {
+    let data = serde_json::json!({ "text": cumulative }).to_string();
+    Ok(SseWireEvent::default().event("token").data(data))
+}
+
+/// Build the terminating `event: error` SSE frame.
+fn sse_error_frame(message: &str) -> Result<SseWireEvent, std::convert::Infallible> {
+    let data = serde_json::json!({ "message": message }).to_string();
+    Ok(SseWireEvent::default().event("error").data(data))
+}
+
+/// Stream one gateway chat turn over Server-Sent Events.
+///
+/// Drives the turn with the same streamed agent API the `/ws/chat` path uses
+/// ([`zeroclaw_runtime::agent::Agent::turn_streamed`]), relaying cumulative
+/// `TurnEvent::Chunk` text as `event: token` frames. The turn's cancellation
+/// token is registered under the same `gw_{session}` key the abort endpoint
+/// uses, so an in-flight streamed turn is cancellable exactly like a
+/// WebSocket turn; a client disconnect cancels the token too.
+async fn run_gateway_chat_streaming_response(
+    state: &AppState,
+    message: &str,
+    session_id: Option<&str>,
+    agent_override: Option<&str>,
+    started_at: Instant,
+) -> Response {
+    if let Some(err) = needs_quickstart_for(&state.model) {
+        if is_needs_quickstart_err(&err) {
+            let body = serde_json::json!({
+                "error": "needs_quickstart",
+                "url": "/quickstart"
+            });
+            return (StatusCode::SERVICE_UNAVAILABLE, Json(body)).into_response();
+        }
+    }
+
+    let (event_tx, mut event_rx) = tokio::sync::mpsc::channel::<zeroclaw_api::agent::TurnEvent>(64);
+    let cancel_token = tokio_util::sync::CancellationToken::new();
+
+    // Register under the gateway session key so the existing abort endpoint
+    // (and the shared cancellation registry) can cancel the in-flight turn.
+    let session_key = format!(
+        "{GW_SESSION_PREFIX}{}",
+        session_id
+            .map(zeroclaw_api::session_keys::sanitize_session_key)
+            .unwrap_or_else(|| uuid::Uuid::new_v4().to_string())
+    );
+    state
+        .cancel_tokens
+        .lock()
+        .expect("cancel_tokens lock poisoned")
+        .insert(session_key.clone(), cancel_token.clone());
+
+    let (frame_tx, frame_rx) =
+        tokio::sync::mpsc::channel::<Result<SseWireEvent, std::convert::Infallible>>(16);
+    let (turn_tx, turn_rx) = tokio::sync::oneshot::channel::<anyhow::Result<String>>();
+
+    let state_for_turn = state.clone();
+    let message_owned = message.to_string();
+    let session_for_turn = session_id.map(str::to_string);
+    let alias_for_turn = agent_override.map(str::to_string);
+    let token_for_turn = cancel_token.clone();
+    zeroclaw_spawn::spawn!(async move {
+        let outcome = dispatch_gateway_turn_streaming(
+            &state_for_turn,
+            &message_owned,
+            event_tx,
+            &token_for_turn,
+            session_for_turn.as_deref(),
+            alias_for_turn.as_deref(),
+        )
+        .await;
+        let _ = turn_tx.send(outcome);
+    });
+
+    let state_for_frames = state.clone();
+    let session_for_frames = session_key.clone();
+    zeroclaw_spawn::spawn!(async move {
+        let mut cumulative = String::new();
+        loop {
+            tokio::select! {
+                maybe = event_rx.recv() => match maybe {
+                    Some(zeroclaw_api::agent::TurnEvent::Chunk { delta }) => {
+                        cumulative.push_str(&delta);
+                        if frame_tx.send(sse_token_frame(&cumulative)).await.is_err() {
+                            // Client went away: cancel the in-flight turn.
+                            cancel_token.cancel();
+                            state_for_frames
+                                .cancel_tokens
+                                .lock()
+                                .expect("cancel_tokens lock poisoned")
+                                .remove(&session_for_frames);
+                            return;
+                        }
+                    }
+                    Some(_) => {}
+                    None => break,
+                },
+                _ = cancel_token.cancelled() => {
+                    state_for_frames
+                        .cancel_tokens
+                        .lock()
+                        .expect("cancel_tokens lock poisoned")
+                        .remove(&session_for_frames);
+                    return;
+                }
+            }
+        }
+        let result = turn_rx
+            .await
+            .unwrap_or_else(|e| Err(anyhow::Error::msg(e.to_string())));
+        state_for_frames
+            .cancel_tokens
+            .lock()
+            .expect("cancel_tokens lock poisoned")
+            .remove(&session_for_frames);
+        state_for_frames.observer.record_metric(
+            &zeroclaw_runtime::observability::traits::ObserverMetric::RequestLatency(
+                started_at.elapsed(),
+            ),
+        );
+        match result {
+            Ok(_) => {
+                let _ = frame_tx
+                    .send(Ok(SseWireEvent::default().event("done").data("{}")))
+                    .await;
+            }
+            Err(e) => {
+                let sanitized = zeroclaw_providers::sanitize_api_error(&e.to_string());
+                let _ = frame_tx.send(sse_error_frame(&sanitized)).await;
+            }
+        }
+    });
+
+    let body = SseBody::new(tokio_stream::wrappers::ReceiverStream::new(frame_rx))
+        .keep_alive(SseKeepAlive::default());
+    (
+        StatusCode::OK,
+        [
+            (header::CACHE_CONTROL, "no-cache"),
+            (header::CONTENT_TYPE, "text/event-stream"),
+        ],
+        body,
+    )
+        .into_response()
+}
+
+/// Dispatch one streamed gateway chat turn, emitting [`TurnEvent`]s on
+/// `event_tx`. Test builds dispatch to the mock model provider directly
+/// (mirroring `run_gateway_chat_with_tools`); production builds construct
+/// the per-request agent and drive it through `turn_streamed`.
+async fn dispatch_gateway_turn_streaming(
+    state: &AppState,
+    message: &str,
+    event_tx: tokio::sync::mpsc::Sender<zeroclaw_api::agent::TurnEvent>,
+    cancel_token: &tokio_util::sync::CancellationToken,
+    session_id: Option<&str>,
+    agent_override: Option<&str>,
+) -> anyhow::Result<String> {
+    #[cfg(test)]
+    {
+        record_gateway_chat_dispatch_for_test(message, session_id, agent_override);
+        let call =
+            state
+                .model_provider
+                .chat_with_system(None, message, &state.model, state.temperature);
+        tokio::select! {
+            result = call => {
+                let response = result?;
+                let _ = event_tx
+                    .send(zeroclaw_api::agent::TurnEvent::Chunk { delta: response.clone() })
+                    .await;
+                Ok(response)
+            }
+            _ = cancel_token.cancelled() => Err(anyhow::Error::msg(
+                "streamed webhook turn cancelled",
+            )),
+        }
+    }
+
+    #[cfg(not(test))]
+    {
+        let config = state.config.read().clone();
+        let agent_alias = require_gateway_chat_agent_alias(&config, agent_override)?;
+        let mut agent =
+            zeroclaw_runtime::agent::Agent::from_live_config_with_session_cwd_and_mcp_backchannel(
+                Arc::clone(&state.config),
+                &agent_alias,
+                None,
+                true,
+                false,
+                false,
+                state.sop_engine.clone(),
+                state.sop_audit.clone(),
+                Some(state.canvas_store.clone()),
+            )
+            .await?;
+        if let Some(session) = session_id {
+            agent.set_memory_session_id(Some(zeroclaw_api::session_keys::sanitize_session_key(
+                session,
+            )));
+        }
+        let (response, _) = agent
+            .turn_streamed(message, event_tx, Some(cancel_token.clone()))
+            .await?;
+        Ok(response)
     }
 }
 
@@ -5966,6 +6219,241 @@ path = "{trigger_path}"
         ConnectInfo(SocketAddr::from(([127, 0, 0, 1], 30_300)))
     }
 
+    /// Minimal AppState for webhook-SSE regressions.
+    fn sse_test_state(model_provider: Arc<dyn ModelProvider>) -> AppState {
+        let memory: Arc<dyn Memory> = Arc::new(MockMemory);
+        AppState {
+            config: Arc::new(RwLock::new(Config::default())),
+            config_write_lock: Arc::new(tokio::sync::Mutex::new(())),
+            model_provider,
+            model: "test-model".into(),
+            temperature: None,
+            mem: memory.clone(),
+            memory_strategy: Arc::new(DefaultMemoryStrategy::with_config(
+                Arc::clone(&memory),
+                zeroclaw_config::schema::MemoryConfig::default(),
+                std::path::PathBuf::new(),
+            )),
+            auto_save: false,
+            pairing: Arc::new(PairingGuard::new(false, &[])),
+            trust_forwarded_headers: false,
+            rate_limiter: Arc::new(GatewayRateLimiter::new(100, 100, 100)),
+            auth_limiter: Arc::new(auth_rate_limit::AuthRateLimiter::new()),
+            idempotency_store: Arc::new(IdempotencyStore::new(Duration::from_secs(300), 1000)),
+            #[cfg(feature = "channel-whatsapp-cloud")]
+            whatsapp: HashMap::new(),
+            #[cfg(feature = "channel-whatsapp-cloud")]
+            whatsapp_app_secret: HashMap::new(),
+            #[cfg(feature = "channel-linq")]
+            linq: HashMap::new(),
+            #[cfg(feature = "channel-linq")]
+            linq_signing_secrets: HashMap::new(),
+            #[cfg(feature = "channel-nextcloud")]
+            nextcloud_talk: HashMap::new(),
+            #[cfg(feature = "channel-nextcloud")]
+            nextcloud_talk_webhook_secret: HashMap::new(),
+            #[cfg(feature = "channel-email")]
+            gmail_push: None,
+            observer: Arc::new(zeroclaw_runtime::observability::NoopObserver),
+            tools_registry: Arc::new(Vec::new()),
+            tools_registry_by_agent: Arc::new(std::collections::HashMap::new()),
+            cost_tracker: None,
+            event_tx: tokio::sync::broadcast::channel(16).0,
+            event_buffer: Arc::new(sse::EventBuffer::new(16)),
+            shutdown_tx: tokio::sync::watch::channel(false).0,
+            reload_tx: None,
+            node_registry: Arc::new(nodes::NodeRegistry::new(16)),
+            mdns_peer_registry: nodes::mdns::MdnsPeerRegistry::default(),
+            path_prefix: String::new(),
+            web_dist_dir: None,
+            session_backend: None,
+            session_queue: std::sync::Arc::new(crate::session_queue::SessionActorQueue::new(
+                8, 30, 600,
+            )),
+            device_registry: None,
+            pending_pairings: None,
+            canvas_store: CanvasStore::new(),
+            cancel_tokens: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
+            pending_reload: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            tui_registry: None,
+            sop_engine: None,
+            sop_audit: None,
+            #[cfg(feature = "webauthn")]
+            webauthn: None,
+        }
+    }
+
+    fn clear_gateway_chat_dispatches() {
+        GATEWAY_CHAT_DISPATCH_CAPTURES
+            .lock()
+            .expect("gateway chat dispatch capture mutex poisoned")
+            .clear();
+    }
+
+    #[tokio::test]
+    async fn webhook_sse_streams_cumulative_token_then_done() {
+        clear_gateway_chat_dispatches();
+        let state = sse_test_state(Arc::new(MockModelProvider::default()));
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            header::ACCEPT,
+            HeaderValue::from_static("text/event-stream"),
+        );
+        let body = Ok(Json(WebhookBody {
+            message: "hello".into(),
+            stream: true,
+        }));
+
+        let response = handle_webhook(
+            State(state.clone()),
+            test_connect_info(),
+            Query(WebhookQuery::default()),
+            headers,
+            body,
+        )
+        .await;
+
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(
+            response
+                .headers()
+                .get(header::CONTENT_TYPE)
+                .and_then(|v| v.to_str().ok()),
+            Some("text/event-stream")
+        );
+
+        let payload = response.into_body().collect().await.unwrap().to_bytes();
+        let text = std::str::from_utf8(&payload).unwrap();
+        assert!(
+            text.contains("event: token") && text.contains(r#"data: {"text":"ok"}"#),
+            "expected a cumulative token frame, got: {text}"
+        );
+        assert!(
+            text.contains("event: done") && text.contains("data: {}"),
+            "expected a terminating done frame, got: {text}"
+        );
+        assert!(
+            !text.contains("event: error"),
+            "unexpected error frame: {text}"
+        );
+        let captures: Vec<_> = GATEWAY_CHAT_DISPATCH_CAPTURES
+            .lock()
+            .expect("gateway chat dispatch capture mutex poisoned")
+            .clone();
+        assert_eq!(
+            captures.last().map(|c| c.message.clone()),
+            Some("hello".to_string()),
+            "streamed dispatch must record the same capture as the JSON path"
+        );
+    }
+
+    #[tokio::test]
+    async fn webhook_stream_true_without_sse_accept_keeps_json() {
+        clear_gateway_chat_dispatches();
+        let state = sse_test_state(Arc::new(MockModelProvider::default()));
+        let body = Ok(Json(WebhookBody {
+            message: "hello".into(),
+            stream: true,
+        }));
+
+        let response = handle_webhook(
+            State(state.clone()),
+            test_connect_info(),
+            Query(WebhookQuery::default()),
+            HeaderMap::new(),
+            body,
+        )
+        .await
+        .into_response();
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let payload = response.into_body().collect().await.unwrap().to_bytes();
+        let parsed: serde_json::Value = serde_json::from_slice(&payload).unwrap();
+        assert_eq!(parsed["response"], "ok");
+    }
+
+    #[tokio::test]
+    async fn webhook_sse_abort_cancels_turn_via_shared_registry() {
+        struct HangingProvider;
+
+        #[async_trait]
+        impl ModelProvider for HangingProvider {
+            async fn chat_with_system(
+                &self,
+                _system_prompt: Option<&str>,
+                _message: &str,
+                _model: &str,
+                _temperature: Option<f64>,
+            ) -> anyhow::Result<String> {
+                std::future::pending::<()>().await;
+                unreachable!("pending future never resolves")
+            }
+        }
+        impl ::zeroclaw_api::attribution::Attributable for HangingProvider {
+            fn role(&self) -> ::zeroclaw_api::attribution::Role {
+                ::zeroclaw_api::attribution::Role::Provider(
+                    ::zeroclaw_api::attribution::ProviderKind::Model(
+                        ::zeroclaw_api::attribution::ModelProviderKind::Custom,
+                    ),
+                )
+            }
+            fn alias(&self) -> &str {
+                "HangingProvider"
+            }
+        }
+
+        let state = sse_test_state(Arc::new(HangingProvider));
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            header::ACCEPT,
+            HeaderValue::from_static("text/event-stream"),
+        );
+        headers.insert("X-Session-Id", HeaderValue::from_static("sse-abort"));
+        let body = Ok(Json(WebhookBody {
+            message: "hello".into(),
+            stream: true,
+        }));
+
+        let state_for_task = state.clone();
+        let task = zeroclaw_spawn::spawn!(async move {
+            handle_webhook(
+                State(state_for_task.clone()),
+                test_connect_info(),
+                Query(WebhookQuery::default()),
+                headers,
+                body,
+            )
+            .await
+            .into_response()
+        });
+        let response = task.await.unwrap();
+
+        // The streamed turn registered its cancellation token under the
+        // gateway session key derived from X-Session-Id.
+        let token = state
+            .cancel_tokens
+            .lock()
+            .expect("cancel_tokens lock poisoned")
+            .get("gw_sse-abort")
+            .cloned();
+        assert!(
+            token.is_some(),
+            "streamed webhook turn must register its cancellation token"
+        );
+
+        // Cancel through the same registry the abort endpoint uses; the
+        // stream must then terminate without a done frame.
+        if let Some(token) = token {
+            token.cancel();
+        }
+        let payload = response.into_body().collect().await.unwrap().to_bytes();
+        let text = std::str::from_utf8(&payload).unwrap();
+        assert!(
+            !text.contains("event: done"),
+            "unexpected done frame: {text}"
+        );
+    }
+
     #[tokio::test]
     async fn webhook_idempotency_skips_duplicate_provider_calls() {
         let provider_impl = Arc::new(MockModelProvider::default());
@@ -6037,6 +6525,7 @@ path = "{trigger_path}"
 
         let body = Ok(Json(WebhookBody {
             message: "hello".into(),
+            stream: false,
         }));
         let first = handle_webhook(
             State(state.clone()),
@@ -6051,6 +6540,7 @@ path = "{trigger_path}"
 
         let body = Ok(Json(WebhookBody {
             message: "hello".into(),
+            stream: false,
         }));
         let second = handle_webhook(
             State(state),
@@ -6247,6 +6737,7 @@ path = "{trigger_path}"
             webhook_secret_header(&secret),
             Ok(Json(WebhookBody {
                 message: "deploy".into(),
+                stream: false,
             })),
         )
         .await
@@ -6266,6 +6757,7 @@ path = "{trigger_path}"
             HeaderMap::new(),
             Ok(Json(WebhookBody {
                 message: "chat instead".into(),
+                stream: false,
             })),
         )
         .await
@@ -6299,6 +6791,7 @@ path = "{trigger_path}"
             headers,
             Ok(Json(WebhookBody {
                 message: "chat".into(),
+                stream: false,
             })),
         )
         .await
@@ -6511,6 +7004,7 @@ path = "{trigger_path}"
             HeaderMap::new(),
             Ok(Json(WebhookBody {
                 message: "deploy".into(),
+                stream: false,
             })),
         )
         .await
@@ -6654,6 +7148,7 @@ path = "{trigger_path}"
             forged,
             Ok(Json(WebhookBody {
                 message: "hello".into(),
+                stream: false,
             })),
         )
         .await
@@ -6799,6 +7294,7 @@ path = "{trigger_path}"
             HeaderMap::new(),
             Ok(Json(WebhookBody {
                 message: "deploy".into(),
+                stream: false,
             })),
         )
         .await
@@ -6856,6 +7352,7 @@ path = "{trigger_path}"
             webhook_secret_header(&secret),
             Ok(Json(WebhookBody {
                 message: "deploy".into(),
+                stream: false,
             })),
         )
         .await
@@ -6951,6 +7448,7 @@ path = "{trigger_path}"
             headers,
             Ok(Json(WebhookBody {
                 message: "hello".into(),
+                stream: false,
             })),
         )
         .await
@@ -7066,6 +7564,7 @@ path = "{trigger_path}"
             HeaderMap::new(),
             Ok(Json(WebhookBody {
                 message: "hello".into(),
+                stream: false,
             })),
         )
         .await
@@ -7160,6 +7659,7 @@ path = "{trigger_path}"
 
         let body1 = Ok(Json(WebhookBody {
             message: "hello one".into(),
+            stream: false,
         }));
         let first = handle_webhook(
             State(state.clone()),
@@ -7174,6 +7674,7 @@ path = "{trigger_path}"
 
         let body2 = Ok(Json(WebhookBody {
             message: "hello two".into(),
+            stream: false,
         }));
         let second = handle_webhook(
             State(state),
@@ -7368,6 +7869,7 @@ path = "{trigger_path}"
             HeaderMap::new(),
             Ok(Json(WebhookBody {
                 message: "hello".into(),
+                stream: false,
             })),
         )
         .await
@@ -7460,6 +7962,7 @@ path = "{trigger_path}"
             headers,
             Ok(Json(WebhookBody {
                 message: "hello".into(),
+                stream: false,
             })),
         )
         .await
@@ -7548,6 +8051,7 @@ path = "{trigger_path}"
             headers,
             Ok(Json(WebhookBody {
                 message: "hello".into(),
+                stream: false,
             })),
         )
         .await
