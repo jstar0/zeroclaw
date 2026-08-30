@@ -2644,8 +2644,8 @@ fn sop_webhook_routes() -> Router<AppState> {
 #[derive(serde::Deserialize)]
 pub struct WebhookBody {
     pub message: String,
-    /// Opt in to Server-Sent Events streaming for this turn (requires an
-    /// `Accept: text/event-stream` header as well). See #10419.
+    /// Opt in to Server-Sent Events streaming for this turn. Callers must also
+    /// send an `Accept: text/event-stream` header.
     #[serde(default)]
     pub stream: bool,
 }
@@ -3051,7 +3051,7 @@ async fn handle_webhook(
     // gives one webhook prompt two unrelated turn IDs.
     let started_at = Instant::now();
 
-    // ── Optional SSE streaming (#10419) ──
+    // ── Optional SSE streaming ──
     // Opt in with `stream: true` plus an `Accept: text/event-stream` header:
     // the turn then streams cumulative assistant tokens as `event: token`
     // frames, ends with `event: done` (or `event: error`), and honours
