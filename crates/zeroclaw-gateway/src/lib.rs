@@ -79,7 +79,7 @@ use axum::{
     extract::{ConnectInfo, Query, State},
     http::{HeaderMap, StatusCode, header},
     response::{
-        IntoResponse, Json, Response,
+        IntoResponse, Json,
         sse::{Event as SseWireEvent, KeepAlive as SseKeepAlive, Sse as SseBody},
     },
     routing::{delete, get, post, put},
