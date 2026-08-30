@@ -551,12 +551,7 @@ impl PendingApprovalResolution {
     }
 }
 
-#[cfg(any(
-    feature = "channel-matrix",
-    feature = "channel-slack",
-    feature = "channel-telegram",
-    test
-))]
+#[cfg(any(feature = "channel-matrix", feature = "channel-slack", test))]
 pub(crate) async fn resolve_pending_approval(
     pending_approvals: &tokio::sync::Mutex<std::collections::HashMap<String, PendingApproval>>,
     token: &str,
