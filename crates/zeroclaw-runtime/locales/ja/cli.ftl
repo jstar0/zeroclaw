@@ -26,7 +26,7 @@ cli-config-about = ZeroClaw設定を管理
 cli-update-about = ZeroClaw更新を確認・適用
 cli-self-test-about = 診断自己テストを実行
 cli-completions-about = シェル補完スクリプトを生成
-cli-desktop-about = ZeroClawコンパニオンデスクトップアプリを起動
+cli-desktop-about = コンパニオンデスクトップアプリを起動、またはダウンロードページを開く
 cli-config-schema-about = 完全な設定JSONスキーマをstdoutにダンプ
 cli-config-list-about = すべての設定プロパティを現在の値とともにリスト表示
 cli-config-get-about = 設定プロパティ値を取得
@@ -316,11 +316,11 @@ cli-desktop-long-about =
 
     コンパニオンアプリは、CLI と同じゲートウェイに接続する軽量のメニューバー/システムトレイアプリケーションです。ダッシュボードへのクイックアクセス、ステータス監視、およびデバイスペアリングを提供します。
 
-    --install を使用して、プラットフォーム用の事前ビルドコンパニオンアプリをダウンロードしてください。
+    --install を使用すると、プラットフォーム用のダウンロードページが開きます。それ自体は何もインストールしません。
 
     例:
     zeroclaw desktop              # コンパニオンアプリを起動
-    zeroclaw desktop --install    # ダウンロードしてインストール
+    zeroclaw desktop --install    # ダウンロードページを開く
 channel-needs-quickstart-reply = このエージェントはまだ完全にセットアップされていません。返信する前に、オペレーターがQuickstartを実行する必要があります。
 channel-whatsapp-web-feature-missing-warning = ⚠ WhatsApp Web は設定されていますが、'whatsapp-web' 機能がコンパイルされていません。
 channel-whatsapp-web-feature-missing-build = ビルド/実行: cargo build --features whatsapp-web
@@ -431,6 +431,7 @@ cli-sop-none = SOP が見つかりません。
 cli-sop-pending-none = 承認待ちの SOP 実行はありません。
 cli-sop-pending-header = 承認待ちの SOP 実行:
 cli-sop-pending-row = {"  "}{$run_id} [{$sop_name}] ステップ {$step}/{$total}
+cli-sop-status-failure-reason = 失敗の理由: {$reason}
 cli-sop-ws-invalid-approval = sop approval_response には run_id と approve または deny の決定が必要です
 cli-sop-ws-resolve-failed = SOP の解決に失敗しました: {$error}
 cli-sop-ws-engine-lock-poisoned = SOP エンジンロックがポイズンされました
@@ -605,6 +606,7 @@ cli-quickstart-error-channel-required = チャンネルタイプとエイリア�
 cli-quickstart-error-channel-field-not-advertised = チャンネルフィールド `{$field}` は Quickstart では使用できません
 cli-quickstart-error-channel-token-required = Telegram Bot トークンが必要です
 cli-quickstart-error-webhook-secret-required = Webhook 共有シークレットが必要です
+cli-quickstart-error-webhook-port-conflict = Webhook ポート {$port} は有効な Webhook `{$alias}` が既に使用しています — 有効な Webhook にはそれぞれ固有のポートが必要です
 cli-quickstart-error-peer-group-name-required = ピアグループ名が必要です
 cli-quickstart-error-peer-group-channel-required = ピアグループのチャンネル参照が必要です
 cli-quickstart-error-peer-group-unknown-channel = ピアグループ `{$name}` が不明なチャンネル `{$channel}` を参照しています
@@ -665,9 +667,9 @@ cli-status-service-stopped = 🔴 サービス:       停止
 cli-status-channels = チャンネル:
 cli-status-cli-always = {"  "}CLI:      ✅ 常時
 cli-status-peripherals = 周辺機器:
-cli-desktop-download = ZeroClaw コンパニオンアプリをダウンロード:
+cli-desktop-download = ZeroClaw コンパニオンアプリのダウンロードページを開きます:
 cli-desktop-homebrew = または Homebrew でインストール(近日対応予定):
-cli-desktop-linux-pkg = {"  "}お使いのアーキテクチャ用の .deb または .AppImage をダウンロードしてください。
+cli-desktop-linux-pkg = {"  "}このページには、アーキテクチャ別の .deb と .AppImage があります。
 cli-desktop-launching = ZeroClaw コンパニオンアプリを起動中...
 cli-status-version = バージョン:     {$v}
 cli-status-workspace = ワークスペース:   {$v}
@@ -972,6 +974,11 @@ sop-rpc-decision-unauthorized = RPC プリンシパルには、この SOP ステ
 sop-rpc-policy-missing = SOP 承認ポリシー '{$name}' が構成されていません。
 sop-rpc-policy-unavailable = 待機中の SOP ポリシーを利用できません: {$reason}。
 
+# ── ターミナルでのツール承認 ──
+# ASCII ショートカットは Rust 側の応答パーサーと一致させます。
+cli-approval-request = 🔧 エージェントが実行しようとしています: {$tool}
+cli-approval-prompt = { "   " }[Y] はい / [N] いいえ / [A] 常に許可（{$tool}）:{ " " }
+
 # ── Tool approval (channels, #9409) ──
 # Human-visible copy for the operator-facing tool-approval prompt, shared
 # across the button adapters (Telegram, Discord, Slack) and the text-reply
@@ -997,6 +1004,7 @@ channel-telegram-approval-ack-always-approved = 常に承認しました
 channel-telegram-approval-ack-denied = 拒否しました
 channel-telegram-approval-ack-not-accepted = 承認は受け付けられませんでした
 channel-telegram-approval-ack-unknown = 不明な操作です
+channel-telegram-approval-ack-already-resolved = 承認はすでに処理済みです
 channel-discord-approval-btn-allow-once = 今回のみ許可
 channel-discord-approval-btn-allow-session = このセッションのみ許可
 channel-discord-approval-btn-allow-always = 常に許可
@@ -1005,3 +1013,21 @@ channel-approval-opt-allow-once = 今回のみ許可
 channel-approval-opt-allow-always = 常に許可
 channel-approval-opt-reject = 拒否
 channel-approval-opt-reject-with-edit = 編集して拒否
+cli-agent-error-provider-context-window = リクエストが選択したモデルのコンテキストウィンドウを超えています。会話を短くするか、より大きなコンテキストウィンドウを持つモデルを選択してください。
+cli-agent-error-provider-credentials-missing = 選択したモデルプロバイダーの認証情報が設定されていません。API キーを追加するか、別のプロバイダーを選択してください。
+cli-agent-error-provider-credentials-missing-named = モデルプロバイダー {$provider} の認証情報が設定されていません。API キーを追加するか、別のプロバイダーを選択してください。
+cli-agent-error-provider-authentication = 選択したモデルプロバイダーが認証情報を拒否しました。設定した認証情報を確認してください。
+cli-agent-error-provider-authentication-named = モデルプロバイダー {$provider} が認証情報を拒否しました。設定した認証情報を確認してください。
+cli-agent-error-provider-rate-limited = 選択したモデルプロバイダーがリクエストをレート制限しました。待機するか、クォータを確認するか、別のプロバイダーを選択してください。
+cli-agent-error-provider-server = 選択したモデルプロバイダーがサーバーエラーを返しました。再試行するか、別のプロバイダーを選択してください。
+cli-agent-error-provider-model-not-found = 選択したモデルを利用できません。設定したモデル名を確認してください。
+cli-agent-error-provider-client-request = 選択したモデルプロバイダーがリクエストを拒否しました。プロバイダー設定とリクエストを確認してください。
+cli-agent-error-provider-connection-local = {$endpoint} のローカルモデルサーバーを利用できません。起動するか、エンドポイントを更新してください。
+cli-agent-error-provider-connection-remote = {$endpoint} のモデルプロバイダーに接続できません。ネットワークアクセスを確認するか、別のプロバイダーを選択してください。
+cli-agent-error-provider-connection = 選択したモデルプロバイダーに接続できません。ネットワークアクセスを確認するか、別のプロバイダーを選択してください。
+cli-agent-error-provider-timeout = 選択したモデルプロバイダーがタイムアウトしました。再試行するか、別のプロバイダーを選択してください。
+cli-agent-error-provider-generic = 選択したモデルプロバイダーで失敗しました。プロバイダー設定を確認するか、別のプロバイダーを選択してください。
+cli-delegate-error-invalid-semantic-completion = エージェント '{$agent_name}' が失敗しました：モデルプロバイダーが無効なセマンティック完了を返しました。
+cli-agent-error-invalid-semantic-completion = モデルプロバイダーが無効なセマンティック完了を返しました。
+cli-delegate-error-incomplete-after-provider-tools = エージェント '{$agent_name}' が失敗しました：モデルプロバイダーがツールを実行した後、最終応答を返さずに終了しました。
+cli-agent-error-incomplete-after-provider-tools = モデルプロバイダーがツールを実行した後、最終応答を返さずに終了しました。

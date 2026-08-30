@@ -29,16 +29,14 @@ pub fn truncate_with_ellipsis(s: &str, max_chars: usize) -> String {
     }
 }
 
-/// Largest byte index `<= max_bytes` that is still a valid UTF-8 boundary.
+/// Returns the largest UTF-8 character boundary at or before `max_bytes`.
+///
+/// This compatibility wrapper preserves the previously exported helper while
+/// directing new callers to the standard-library implementation.
+#[deprecated(since = "0.8.4", note = "use str::floor_char_boundary instead")]
 pub fn floor_char_boundary(s: &str, max_bytes: usize) -> usize {
-    if max_bytes >= s.len() {
-        return s.len();
-    }
-    let mut end = max_bytes;
-    while end > 0 && !s.is_char_boundary(end) {
-        end -= 1;
-    }
-    end
+    // Keep downstream callers source-compatible without retaining duplicate boundary logic.
+    s.floor_char_boundary(max_bytes)
 }
 
 #[cfg(any(feature = "channel-mattermost", feature = "channel-qq"))]
@@ -523,6 +521,7 @@ pub(crate) fn build_approve_deny_approval_prompt(
 pub(crate) struct PendingApproval {
     pub(crate) sender: tokio::sync::oneshot::Sender<zeroclaw_api::channel::ChannelApprovalResponse>,
     pub(crate) destination: String,
+    pub(crate) tool_name: String,
 }
 
 #[cfg(any(
@@ -565,22 +564,46 @@ pub(crate) async fn resolve_pending_approval(
     responder_allowed: bool,
     destination: &str,
 ) -> PendingApprovalResolution {
+    resolve_pending_approval_with_tool(
+        pending_approvals,
+        token,
+        response,
+        responder_allowed,
+        destination,
+    )
+    .await
+    .0
+}
+
+#[cfg(any(
+    feature = "channel-matrix",
+    feature = "channel-slack",
+    feature = "channel-telegram",
+    test
+))]
+pub(crate) async fn resolve_pending_approval_with_tool(
+    pending_approvals: &tokio::sync::Mutex<std::collections::HashMap<String, PendingApproval>>,
+    token: &str,
+    response: zeroclaw_api::channel::ChannelApprovalResponse,
+    responder_allowed: bool,
+    destination: &str,
+) -> (PendingApprovalResolution, Option<String>) {
     let mut pending_approvals = pending_approvals.lock().await;
     let Some(pending) = pending_approvals.get(token) else {
-        return PendingApprovalResolution::NotFound;
+        return (PendingApprovalResolution::NotFound, None);
     };
     if !responder_allowed || destination.is_empty() || pending.destination != destination {
-        return PendingApprovalResolution::Rejected;
+        return (PendingApprovalResolution::Rejected, None);
     }
 
     let Some(pending) = pending_approvals.remove(token) else {
-        return PendingApprovalResolution::NotFound;
+        return (PendingApprovalResolution::NotFound, None);
     };
     drop(pending_approvals);
     if pending.sender.send(response).is_ok() {
-        PendingApprovalResolution::Resolved
+        (PendingApprovalResolution::Resolved, Some(pending.tool_name))
     } else {
-        PendingApprovalResolution::ReceiverClosed
+        (PendingApprovalResolution::ReceiverClosed, None)
     }
 }
 
@@ -598,6 +621,16 @@ pub fn conversation_history_key(msg: &zeroclaw_api::channel::ChannelMessage) -> 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Verifies the exported compatibility wrapper retains the legacy UTF-8 boundary contract.
+    #[allow(deprecated)]
+    #[test]
+    fn floor_char_boundary_compatibility_wrapper_delegates_to_std() {
+        let text = "abc😀def";
+
+        assert_eq!(floor_char_boundary(text, 5), 3);
+        assert_eq!(floor_char_boundary(text, usize::MAX), text.len());
+    }
 
     #[cfg(any(feature = "channel-mattermost", feature = "channel-qq"))]
     async fn response_from_raw_http(
@@ -692,14 +725,6 @@ mod tests {
                 "channel-runtime-progress-finalizing-response",
             ]
         );
-    }
-
-    #[test]
-    fn floor_char_boundary_handles_mid_codepoint_offset() {
-        let text = "abc😀def";
-
-        assert_eq!(super::floor_char_boundary(text, 5), 3);
-        assert_eq!(super::floor_char_boundary(text, usize::MAX), text.len());
     }
 
     #[test]
@@ -1083,6 +1108,7 @@ mod tests {
             PendingApproval {
                 sender: tx,
                 destination: "room-a".to_string(),
+                tool_name: "tool".to_string(),
             },
         );
 
@@ -1156,6 +1182,7 @@ mod tests {
             PendingApproval {
                 sender: tx,
                 destination: "room-a".to_string(),
+                tool_name: "tool".to_string(),
             },
         );
 

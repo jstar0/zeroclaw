@@ -27,7 +27,7 @@ cli-config-about = Manage ZeroClaw configuration
 cli-update-about = Check for and apply ZeroClaw updates
 cli-self-test-about = Run diagnostic self-tests
 cli-completions-about = Generate shell completion scripts
-cli-desktop-about = Launch the ZeroClaw companion desktop app
+cli-desktop-about = Launch the companion desktop app, or open its download page
 
 cli-config-schema-about = Dump the full configuration JSON Schema to stdout
 cli-config-list-about = List all config properties with current values
@@ -179,6 +179,7 @@ cli-sop-validate-about = Validate SOP definitions
 cli-sop-show-about = Show details of an SOP
 
 cli-migrate-openclaw-about = Import memory from an OpenClaw workspace into this ZeroClaw workspace
+cli-migrate-openclaw-qdrant-unsupported = Qdrant is not currently supported as an OpenClaw migration target. Set memory.backend to sqlite, lucid, or markdown and retry.
 
 cli-agent-long-about =
     Start the AI agent loop.
@@ -363,11 +364,11 @@ cli-desktop-long-about =
 
     The companion app is a lightweight menu bar / system tray application that connects to the same gateway as the CLI. It provides quick access to the dashboard, status monitoring, and device pairing.
 
-    Use --install to download the pre-built companion app for your platform.
+    Use --install to open the download page for your platform. It does not install anything itself.
 
     Examples:
       zeroclaw desktop              # launch the companion app
-      zeroclaw desktop --install    # download and install it
+      zeroclaw desktop --install    # open the download page
 
 # Channel-side reply emitted when chat dispatch refuses because the
 # gateway has no model configured. Used by the gateway crate channel
@@ -506,6 +507,7 @@ cli-sop-none = No SOPs found.
 cli-sop-pending-none = No SOP runs waiting for approval.
 cli-sop-pending-header = SOP runs waiting for approval:
 cli-sop-pending-row = {"  "}{$run_id} [{$sop_name}] step {$step}/{$total}
+cli-sop-status-failure-reason = Failure reason: {$reason}
 # gateway WebSocket SOP approval error frames (UI-surfaced)
 cli-sop-ws-invalid-approval = sop approval_response requires run_id and a decision of approve or deny
 cli-sop-ws-resolve-failed = sop resolve failed: {$error}
@@ -687,6 +689,7 @@ cli-quickstart-error-channel-required = channel type and alias are required
 cli-quickstart-error-channel-field-not-advertised = channel field `{$field}` is not available in Quickstart
 cli-quickstart-error-channel-token-required = Telegram bot token is required
 cli-quickstart-error-webhook-secret-required = Webhook shared secret is required
+cli-quickstart-error-webhook-port-conflict = webhook port {$port} is already used by enabled webhook `{$alias}` — each enabled webhook needs its own port
 cli-quickstart-error-peer-group-name-required = peer-group name is required
 cli-quickstart-error-peer-group-channel-required = peer-group channel ref is required
 cli-quickstart-error-peer-group-unknown-channel = peer-group `{$name}` references unknown channel `{$channel}`
@@ -749,9 +752,9 @@ cli-status-service-stopped = 🔴 Service:       stopped
 cli-status-channels = Channels:
 cli-status-cli-always = {"  "}CLI:      ✅ always
 cli-status-peripherals = Peripherals:
-cli-desktop-download = Download the ZeroClaw companion app:
+cli-desktop-download = Opening the ZeroClaw companion app download page:
 cli-desktop-homebrew = Or install via Homebrew (coming soon):
-cli-desktop-linux-pkg = {"  "}Download the .deb or .AppImage for your architecture.
+cli-desktop-linux-pkg = {"  "}The page provides .deb and .AppImage downloads by architecture.
 cli-desktop-launching = Launching ZeroClaw companion app...
 
 # ── status fields ──
@@ -1093,6 +1096,20 @@ cli-delegate-error-invalid-semantic-completion = Agent '{$agent_name}' failed: m
 cli-agent-error-invalid-semantic-completion = The model provider returned an invalid semantic completion.
 cli-delegate-error-incomplete-after-provider-tools = Agent '{$agent_name}' failed: the model provider ended after provider-executed tools without a final response.
 cli-agent-error-incomplete-after-provider-tools = The model provider ended after provider-executed tools without a final response.
+cli-agent-error-provider-context-window = The request is too large for the selected model. Reduce the conversation or choose a model with a larger context window.
+cli-agent-error-provider-credentials-missing = The selected model provider has no configured credentials. Add its API key or choose another provider.
+cli-agent-error-provider-credentials-missing-named = The model provider {$provider} has no configured credentials. Add its API key or choose another provider.
+cli-agent-error-provider-authentication = The selected model provider rejected its credentials. Check the configured credentials.
+cli-agent-error-provider-authentication-named = The model provider {$provider} rejected its credentials. Check the configured credentials.
+cli-agent-error-provider-rate-limited = The selected model provider rate-limited the request. Wait, review quota, or choose another provider.
+cli-agent-error-provider-server = The selected model provider returned a server error. Try again or choose another provider.
+cli-agent-error-provider-model-not-found = The selected model is unavailable. Check the configured model name.
+cli-agent-error-provider-client-request = The selected model provider rejected the request. Check the provider configuration and request.
+cli-agent-error-provider-connection-local = The local model server at {$endpoint} is unavailable. Start it or update the endpoint.
+cli-agent-error-provider-connection-remote = Cannot reach the model provider at {$endpoint}. Check network access or choose another provider.
+cli-agent-error-provider-connection = Cannot reach the selected model provider. Check network access or choose another provider.
+cli-agent-error-provider-timeout = The selected model provider timed out. Try again or choose another provider.
+cli-agent-error-provider-generic = The selected model provider failed. Review provider configuration or choose another provider.
 cli-doctor-context-window-ok = {$provider_ref}: context window: {$context_window} tokens
 cli-doctor-context-window-zero = {$provider_ref}: context_window is 0 (invalid; set it to the model's real context limit)
 cli-doctor-context-window-unset = {$provider_ref}: no context_window set — will use {$fallback} token fallback when selected; likely far below this model's real limit; set context_window on this profile
@@ -1117,6 +1134,7 @@ cli-doctor-probe-timeout-message = Model probing timed out. Some provider catalo
 # ── Degraded config sections (doctor diagnose, #8835) ──
 cli-doctor-degraded-security = SECURITY-CRITICAL config section `{$path}` is invalid and was reset to its default so the daemon can boot; the running posture may be WEAKER than intended. Run `zeroclaw config migrate` to see the parse error, then repair the file.
 cli-doctor-degraded-section = config section `{$path}` is malformed and was reset to defaults; values in that section are NOT in effect. Run `zeroclaw config migrate` to see the parse error, then repair the file.
+cli-doctor-verifiable-intent-tool-withheld = verifiable_intent.enabled is set, but the vi_verify tool is withheld from the model-visible registry until a credential chain verifier exists. Enabling the section does not enable credential verification on commerce tool calls. The issuance and verification library paths are unaffected.
 sop-approval-deferred-at-capacity = Approval could not resume run {$run_id}: execution slots are full. The gate remains waiting; retry after a slot frees.
 sop-approval-policy-unavailable = Approval failed because the parked SOP step is unavailable: {$reason}. The run remains waiting.
 sop-rpc-decision-invalid-state = Run {$run_id} cannot be resolved in its current state.
@@ -1128,6 +1146,11 @@ sop-rpc-policy-unavailable = The parked SOP policy is unavailable: {$reason}.
 tool-runtime-command-build-failed = Failed to build runtime command: {$error}
 tool-runtime-command-docker-workspace-path = Failed to build runtime command: Failed to canonicalize Docker workspace path {$path}: {$cause}
 tool-runtime-command-docker-allowed-root = Failed to build runtime command: Failed to canonicalize Docker workspace root {$path}: {$cause}
+
+# ── Terminal tool approval ──
+# The ASCII shortcut tokens stay aligned with the Rust-owned response parser.
+cli-approval-request = 🔧 Agent wants to execute: {$tool}
+cli-approval-prompt = { "   " }[Y]es / [N]o / [A]lways for {$tool}:{ " " }
 
 # ── Tool approval (channels, #9409) ──
 # Human-visible copy for the operator-facing tool-approval prompt, shared
@@ -1154,6 +1177,7 @@ channel-telegram-approval-ack-always-approved = Always approved
 channel-telegram-approval-ack-denied = Denied
 channel-telegram-approval-ack-not-accepted = Approval not accepted
 channel-telegram-approval-ack-unknown = Unknown action
+channel-telegram-approval-ack-already-resolved = Approval already resolved
 channel-discord-approval-btn-allow-once = Allow once
 channel-discord-approval-btn-allow-session = Allow this session
 channel-discord-approval-btn-allow-always = Always allow

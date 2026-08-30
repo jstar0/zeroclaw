@@ -3428,6 +3428,7 @@ mod outbound {
                 file_name,
                 data: bytes,
                 mime_type: Some(mime),
+                marker: None,
             };
             match upload_attachment(room, &att, kind, thread_anchor).await {
                 Ok(id) => last_attachment_id = Some(id),
@@ -4887,6 +4888,7 @@ impl Channel for MatrixChannel {
             crate::util::PendingApproval {
                 sender: tx,
                 destination,
+                tool_name: request.tool_name.clone(),
             },
         );
 
@@ -5847,6 +5849,7 @@ mod tests {
                     crate::util::PendingApproval {
                         sender: approved_tx,
                         destination: test_room().to_string(),
+                        tool_name: "tool".to_string(),
                     },
                 );
                 approvals.insert(
@@ -5854,6 +5857,7 @@ mod tests {
                     crate::util::PendingApproval {
                         sender: wrong_tx,
                         destination: "!other:localhost".into(),
+                        tool_name: "tool".to_string(),
                     },
                 );
                 approvals.insert(
@@ -5861,6 +5865,7 @@ mod tests {
                     crate::util::PendingApproval {
                         sender: unauthorized_tx,
                         destination: test_room().to_string(),
+                        tool_name: "tool".to_string(),
                     },
                 );
             }
@@ -6007,6 +6012,7 @@ mod tests {
                 crate::util::PendingApproval {
                     sender: tx,
                     destination: "!origin:example.invalid".to_string(),
+                    tool_name: "tool".to_string(),
                 },
             );
 
@@ -6070,6 +6076,7 @@ mod tests {
                 crate::util::PendingApproval {
                     sender: approve_tx,
                     destination: "!origin:example.invalid".to_string(),
+                    tool_name: "tool".to_string(),
                 },
             );
             assert_eq!(
@@ -9705,6 +9712,7 @@ mod tests {
                 file_name: file_name.to_string(),
                 data: vec![0; len],
                 mime_type: Some(mime_type.to_string()),
+                marker: None,
             }
         }
 

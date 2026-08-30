@@ -16,6 +16,7 @@ use tokio::sync::RwLock;
 use tokio_tungstenite::tungstenite::Message as WsMsg;
 use uuid::Uuid;
 use zeroclaw_api::channel::{Channel, ChannelMessage, SendMessage};
+use zeroclaw_config::pairing::constant_time_eq;
 use zeroclaw_config::schema::StreamMode;
 
 const FEISHU_BASE_URL: &str = "https://open.feishu.cn/open-apis";
@@ -315,9 +316,7 @@ fn build_resolved_approval_card(
         ChannelApprovalResponse::Approve => ("✅", "Approved", "green"),
         ChannelApprovalResponse::AlwaysApprove => ("✅✅", "Approved (always)", "green"),
         ChannelApprovalResponse::Deny => ("❌", "Denied", "red"),
-        ChannelApprovalResponse::DenyWithEdit { .. } => {
-            unreachable!("DenyWithEdit is only valid for ACP channels")
-        }
+        ChannelApprovalResponse::DenyWithEdit { .. } => ("❌", "Denied", "red"),
     };
 
     serde_json::json!({
@@ -771,7 +770,7 @@ pub struct LarkChannel {
 }
 
 #[derive(Clone)]
-struct LarkWebhookState {
+struct LarkHttpAppState {
     verification_token: String,
     channel: Arc<LarkChannel>,
     tx: tokio::sync::mpsc::Sender<ChannelMessage>,
@@ -779,6 +778,17 @@ struct LarkWebhookState {
 
 fn lark_webhook_auth_configured(verification_token: &str, encrypt_key: Option<&str>) -> bool {
     !verification_token.is_empty() || encrypt_key.is_some_and(|key| !key.is_empty())
+}
+
+/// Verify an incoming Lark verification token against the configured token.
+/// Missing, null, non-string, and empty incoming tokens are rejected; an empty
+/// configured token also rejects all token-authenticated requests.
+fn verify_challenge_token(incoming: Option<&serde_json::Value>, configured: &str) -> bool {
+    incoming
+        .and_then(serde_json::Value::as_str)
+        .is_some_and(|token| {
+            !token.is_empty() && !configured.is_empty() && constant_time_eq(token, configured)
+        })
 }
 
 fn verify_lark_webhook_request(
@@ -836,11 +846,12 @@ fn verify_lark_webhook_request(
         return false;
     }
 
-    let token = payload
-        .pointer("/header/token")
-        .or_else(|| payload.get("token"))
-        .and_then(serde_json::Value::as_str);
-    !verification_token.is_empty() && token == Some(verification_token)
+    verify_challenge_token(
+        payload
+            .pointer("/header/token")
+            .or_else(|| payload.get("token")),
+        verification_token,
+    )
 }
 
 fn decrypt_lark_webhook_body(body: &[u8], encrypt_key: Option<&str>) -> anyhow::Result<Vec<u8>> {
@@ -877,8 +888,8 @@ fn decrypt_lark_webhook_body(body: &[u8], encrypt_key: Option<&str>) -> anyhow::
     Ok(plaintext.to_vec())
 }
 
-async fn handle_lark_webhook_event(
-    axum::extract::State(state): axum::extract::State<LarkWebhookState>,
+async fn handle_lark_http_event(
+    axum::extract::State(state): axum::extract::State<LarkHttpAppState>,
     headers: axum::http::HeaderMap,
     body: axum::body::Bytes,
 ) -> axum::response::Response {
@@ -914,13 +925,27 @@ async fn handle_lark_webhook_event(
         }
     };
 
-    if !verify_lark_webhook_request(
+    let authenticated = verify_lark_webhook_request(
         &state.verification_token,
         state.channel.encrypt_key.as_deref(),
         &headers,
         &body,
         &payload,
-    ) {
+    );
+
+    if let Some(challenge_value) = payload.get("challenge") {
+        let Some(challenge) = challenge_value.as_str() else {
+            return (StatusCode::FORBIDDEN, "invalid challenge").into_response();
+        };
+        if !authenticated {
+            return (StatusCode::FORBIDDEN, "invalid token").into_response();
+        }
+
+        let resp = serde_json::json!({ "challenge": challenge });
+        return (StatusCode::OK, axum::Json(resp)).into_response();
+    }
+
+    if !authenticated {
         ::zeroclaw_log::record!(
             WARN,
             ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Reject)
@@ -928,12 +953,6 @@ async fn handle_lark_webhook_event(
             "Lark webhook: invalid authentication"
         );
         return (StatusCode::UNAUTHORIZED, "invalid authentication").into_response();
-    }
-
-    // URL verification challenge
-    if let Some(challenge) = payload.get("challenge").and_then(|c| c.as_str()) {
-        let resp = serde_json::json!({ "challenge": challenge });
-        return (StatusCode::OK, axum::Json(resp)).into_response();
     }
 
     // Card button click events are not message events — route them
@@ -1000,6 +1019,12 @@ async fn handle_lark_webhook_event(
     }
 
     (StatusCode::OK, "ok").into_response()
+}
+
+fn build_lark_http_router(state: LarkHttpAppState) -> axum::Router {
+    axum::Router::new()
+        .route("/lark", axum::routing::post(handle_lark_http_event))
+        .with_state(state)
 }
 
 impl LarkChannel {
@@ -3796,8 +3821,6 @@ impl LarkChannel {
         &self,
         tx: tokio::sync::mpsc::Sender<ChannelMessage>,
     ) -> anyhow::Result<()> {
-        use axum::{Router, routing::post};
-
         if !lark_webhook_auth_configured(&self.verification_token, self.encrypt_key.as_deref()) {
             ::zeroclaw_log::record!(
                 ERROR,
@@ -3815,7 +3838,6 @@ impl LarkChannel {
         }
 
         self.ensure_bot_open_id().await;
-
         let port = self.port.ok_or_else(|| {
             ::zeroclaw_log::record!(
                 ERROR,
@@ -3827,15 +3849,12 @@ impl LarkChannel {
             anyhow::Error::msg("webhook mode requires `port` to be set in [channels_config.lark]")
         })?;
 
-        let state = LarkWebhookState {
+        let state = LarkHttpAppState {
             verification_token: self.verification_token.clone(),
             channel: Arc::new(self.clone()),
             tx,
         };
-
-        let app = Router::new()
-            .route("/lark", post(handle_lark_webhook_event))
-            .with_state(state);
+        let app = build_lark_http_router(state);
 
         let addr = std::net::SocketAddr::from(([0, 0, 0, 0], port));
         ::zeroclaw_log::record!(
@@ -3958,7 +3977,7 @@ fn lark_is_text_filename(name: &str) -> bool {
 
 fn lark_inline_text_file_preview(text: Cow<'_, str>) -> String {
     if text.len() > 50_000 {
-        let end = crate::util::floor_char_boundary(text.as_ref(), 50_000);
+        let end = text.floor_char_boundary(50_000);
         format!("{}...\n[truncated]", &text[..end])
     } else {
         text.into_owned()
@@ -4185,6 +4204,7 @@ fn should_respond_in_group(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use axum::{body::to_bytes, extract::State, http::StatusCode};
 
     fn with_bot_open_id(ch: LarkChannel, bot_open_id: &str) -> LarkChannel {
         ch.set_resolved_bot_open_id(Some(bot_open_id.to_string()));
@@ -4212,6 +4232,121 @@ mod tests {
 
     fn make_channel() -> LarkChannel {
         make_channel_with_peers(vec!["ou_testuser123".into()])
+    }
+
+    async fn post_lark_challenge(
+        verification_token: &str,
+        payload: serde_json::Value,
+    ) -> (StatusCode, String) {
+        let (tx, _rx) = tokio::sync::mpsc::channel(1);
+        let response = handle_lark_http_event(
+            State(LarkHttpAppState {
+                verification_token: verification_token.to_string(),
+                channel: Arc::new(make_channel()),
+                tx,
+            }),
+            axum::http::HeaderMap::new(),
+            axum::body::Bytes::from(serde_json::to_vec(&payload).unwrap()),
+        )
+        .await;
+        let status = response.status();
+        let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        (status, String::from_utf8(body.to_vec()).unwrap())
+    }
+
+    #[tokio::test]
+    async fn lark_url_verification_handler_rejects_invalid_tokens() {
+        let invalid_challenges = [
+            serde_json::json!({ "challenge": "abc" }),
+            serde_json::json!({ "challenge": "abc", "token": null }),
+            serde_json::json!({ "challenge": "abc", "token": 42 }),
+            serde_json::json!({ "challenge": "abc", "token": "" }),
+            serde_json::json!({ "challenge": "abc", "token": "wrong" }),
+        ];
+
+        for payload in invalid_challenges {
+            let (status, body) = post_lark_challenge("test_verification_token", payload).await;
+            assert_eq!(status, StatusCode::FORBIDDEN);
+            assert_eq!(body, "invalid token");
+        }
+
+        let (status, body) = post_lark_challenge(
+            "",
+            serde_json::json!({ "challenge": "abc", "token": "test_verification_token" }),
+        )
+        .await;
+        assert_eq!(status, StatusCode::FORBIDDEN);
+        assert_eq!(body, "invalid token");
+
+        for payload in [
+            serde_json::json!({ "challenge": null, "token": "test_verification_token" }),
+            serde_json::json!({ "challenge": 42, "token": "test_verification_token" }),
+        ] {
+            let (status, body) = post_lark_challenge("test_verification_token", payload).await;
+            assert_eq!(status, StatusCode::FORBIDDEN);
+            assert_eq!(body, "invalid challenge");
+        }
+    }
+
+    #[tokio::test]
+    async fn lark_url_verification_handler_echoes_valid_challenge() {
+        let (status, body) = post_lark_challenge(
+            "test_verification_token",
+            serde_json::json!({ "challenge": "abc", "token": "test_verification_token" }),
+        )
+        .await;
+
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body, r#"{"challenge":"abc"}"#);
+    }
+
+    #[test]
+    fn lark_url_verification_accepts_valid_token() {
+        let configured = "test_verification_token";
+        let payload = serde_json::json!({ "token": configured });
+        assert!(verify_challenge_token(payload.get("token"), configured));
+    }
+
+    #[test]
+    fn lark_url_verification_rejects_wrong_token() {
+        let configured = "test_verification_token";
+        let payload = serde_json::json!({ "token": "wrong_token" });
+        assert!(!verify_challenge_token(payload.get("token"), configured));
+    }
+
+    #[test]
+    fn lark_url_verification_rejects_missing_token() {
+        let configured = "test_verification_token";
+        let payload = serde_json::json!({ "challenge": "abc" });
+        assert!(!verify_challenge_token(payload.get("token"), configured));
+    }
+
+    #[test]
+    fn lark_url_verification_rejects_null_token() {
+        let configured = "test_verification_token";
+        let payload = serde_json::json!({ "token": null });
+        assert!(!verify_challenge_token(payload.get("token"), configured));
+    }
+
+    #[test]
+    fn lark_url_verification_rejects_non_string_token() {
+        let configured = "test_verification_token";
+        let payload = serde_json::json!({ "token": 12345 });
+        assert!(!verify_challenge_token(payload.get("token"), configured));
+    }
+
+    #[test]
+    fn lark_url_verification_rejects_empty_token() {
+        let configured = "test_verification_token";
+        let payload = serde_json::json!({ "token": "" });
+        assert!(!verify_challenge_token(payload.get("token"), configured));
+    }
+
+    #[test]
+    fn lark_url_verification_rejects_when_configured_token_empty() {
+        let configured = "";
+        let payload = serde_json::json!({ "token": "" });
+        assert!(!verify_challenge_token(payload.get("token"), configured));
     }
 
     #[test]
@@ -5896,6 +6031,13 @@ mod tests {
                 "Approved (always)",
             ),
             (ChannelApprovalResponse::Deny, "red", "Denied"),
+            (
+                ChannelApprovalResponse::DenyWithEdit {
+                    replacement: "edited".to_string(),
+                },
+                "red",
+                "Denied",
+            ),
         ] {
             let card = build_resolved_approval_card("shell", "args", decision.clone());
             assert_eq!(
@@ -6292,7 +6434,7 @@ mod tests {
         }
 
         async fn post_card_action(
-            state: LarkWebhookState,
+            state: LarkHttpAppState,
             mut envelope: serde_json::Value,
             authenticate: bool,
         ) -> axum::response::Response {
@@ -6301,7 +6443,7 @@ mod tests {
             }
             let body = serde_json::to_vec(&envelope).unwrap();
             let headers = HeaderMap::new();
-            handle_lark_webhook_event(State(state), headers, Bytes::from(body)).await
+            handle_lark_http_event(State(state), headers, Bytes::from(body)).await
         }
 
         let mut configured_channel = make_channel();
@@ -6335,7 +6477,7 @@ mod tests {
         }
 
         let (tx, mut messages) = tokio::sync::mpsc::channel(1);
-        let state = LarkWebhookState {
+        let state = LarkHttpAppState {
             verification_token: "test_verification_token".to_string(),
             channel: Arc::clone(&channel),
             tx,
@@ -6411,7 +6553,7 @@ mod tests {
             &serde_json::to_vec(&encrypted_envelope).unwrap(),
             "test_encrypt_key",
         );
-        let encrypted_response = handle_lark_webhook_event(
+        let encrypted_response = handle_lark_http_event(
             State(state),
             signed_headers(&encrypted_body, "test_encrypt_key"),
             Bytes::from(encrypted_body),
