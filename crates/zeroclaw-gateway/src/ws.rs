@@ -1054,7 +1054,7 @@ async fn process_chat_message(
             .cancel_tokens
             .lock()
             .expect("cancel_tokens lock poisoned")
-            .insert(session_key.to_string(), cancel_token.clone());
+            .insert(session_key.to_string(), Arc::new(cancel_token.clone()));
     }
 
     // Channel for streaming turn events from the agent.

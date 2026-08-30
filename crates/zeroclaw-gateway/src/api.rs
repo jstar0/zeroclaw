@@ -3627,7 +3627,7 @@ pub(crate) mod tests {
             .cancel_tokens
             .lock()
             .expect("cancel_tokens lock")
-            .insert(session_key.clone(), token.clone());
+            .insert(session_key.clone(), std::sync::Arc::new(token.clone()));
 
         // Same id GET /api/sessions advertises as session_key for abort.
         let response = handle_api_session_abort(State(state), HeaderMap::new(), Path(session_key))
@@ -3651,7 +3651,10 @@ pub(crate) mod tests {
             .cancel_tokens
             .lock()
             .expect("cancel_tokens lock")
-            .insert("gw_operator-1".to_string(), token.clone());
+            .insert(
+                "gw_operator-1".to_string(),
+                std::sync::Arc::new(token.clone()),
+            );
 
         let response = handle_api_session_abort(
             State(state),
@@ -3675,7 +3678,10 @@ pub(crate) mod tests {
             .cancel_tokens
             .lock()
             .expect("cancel_tokens lock")
-            .insert("gw_team_alpha".to_string(), token.clone());
+            .insert(
+                "gw_team_alpha".to_string(),
+                std::sync::Arc::new(token.clone()),
+            );
 
         // List contract: session_id=team_alpha, session_key=gw_team_alpha.
         // Treating "_" as "already a full key" would miss this cancel token.
