@@ -10,6 +10,7 @@ const MAX_RUN_OUTPUT_CHARS: usize = 500;
 
 pub struct CronRunsTool {
     config: Arc<Config>,
+    /// Owning agent — run history for another agent's job is not readable.
     agent_alias: String,
 }
 
@@ -74,11 +75,6 @@ impl Tool for CronRunsTool {
             }
         };
 
-        let limit = args
-            .get("limit")
-            .and_then(serde_json::Value::as_u64)
-            .map_or(10, |v| usize::try_from(v).unwrap_or(10));
-
         let job_id = match cron::get_job_for_agent(&self.config, raw_job_id, &self.agent_alias) {
             Ok(job) => job.id,
             Err(e) => {
@@ -89,6 +85,11 @@ impl Tool for CronRunsTool {
                 });
             }
         };
+
+        let limit = args
+            .get("limit")
+            .and_then(serde_json::Value::as_u64)
+            .map_or(10, |v| usize::try_from(v).unwrap_or(10));
 
         match cron::list_runs_for_agent(&self.config, &job_id, &self.agent_alias, limit) {
             Ok(runs) => {
@@ -213,21 +214,44 @@ mod tests {
         );
     }
 
+    /// A job owned by someone else. An agent job needs no risk profile for its
+    /// owner, which keeps the fixture to the ownership boundary.
+    fn other_agents_job(cfg: &Config) -> crate::cron::CronJob {
+        cron::add_agent_job(
+            cfg,
+            "other-agent",
+            Some("secret_job".into()),
+            crate::cron::Schedule::Cron {
+                expr: "0 8 * * *".into(),
+                tz: None,
+            },
+            "read the other agent's inbox",
+            crate::cron::SessionTarget::Isolated,
+            None,
+            None,
+            false,
+            None,
+            true,
+        )
+        .unwrap()
+    }
+
     #[tokio::test]
-    async fn refuses_to_read_another_agents_run_history() {
+    async fn cannot_read_another_agents_run_history() {
         let tmp = TempDir::new().unwrap();
         let cfg = test_config(&tmp).await;
-        let job = cron::add_job(&cfg, TEST_AGENT, "*/5 * * * *", "echo private").unwrap();
-        let now = Utc::now();
-        cron::record_run(&cfg, &job.id, now, now, "ok", Some("private output"), 0).unwrap();
+        let theirs = other_agents_job(&cfg);
+        let now = chrono::Utc::now();
+        cron::record_run(&cfg, &theirs.id, now, now, "ok", Some("private-output"), 5).unwrap();
 
-        let tool = CronRunsTool::new(cfg, "other-agent");
-        let result = tool
-            .execute(json!({ "job_id": job.id, "limit": 5 }))
-            .await
-            .unwrap();
+        let tool = CronRunsTool::new(cfg.clone(), TEST_AGENT);
+        let result = tool.execute(json!({"job_id": theirs.id})).await.unwrap();
 
         assert!(!result.success);
         assert!(result.error.unwrap_or_default().contains("not found"));
+        assert!(
+            !format!("{:?}", result.output).contains("private-output"),
+            "another agent's job output must not leak"
+        );
     }
 }
