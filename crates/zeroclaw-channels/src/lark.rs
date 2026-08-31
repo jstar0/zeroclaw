@@ -791,6 +791,13 @@ fn verify_challenge_token(incoming: Option<&serde_json::Value>, configured: &str
         })
 }
 
+fn lark_webhook_is_encrypted(payload: &serde_json::Value) -> bool {
+    payload
+        .get("encrypt")
+        .and_then(serde_json::Value::as_str)
+        .is_some_and(|value| !value.is_empty())
+}
+
 fn verify_lark_webhook_request(
     verification_token: &str,
     encrypt_key: Option<&str>,
@@ -813,11 +820,7 @@ fn verify_lark_webhook_request(
         .filter(|value| !value.is_empty());
 
     let raw_envelope = serde_json::from_slice::<serde_json::Value>(body).ok();
-    let encrypted = raw_envelope
-        .as_ref()
-        .and_then(|value| value.get("encrypt"))
-        .and_then(serde_json::Value::as_str)
-        .is_some_and(|value| !value.is_empty());
+    let encrypted = raw_envelope.as_ref().is_some_and(lark_webhook_is_encrypted);
 
     let has_any_signature_header = timestamp.is_some() || nonce.is_some() || signature.is_some();
     let encrypt_key = encrypt_key.filter(|value| !value.is_empty());
@@ -896,6 +899,38 @@ async fn handle_lark_http_event(
     use axum::http::StatusCode;
     use axum::response::IntoResponse;
 
+    let raw_payload: serde_json::Value = match serde_json::from_slice(&body) {
+        Ok(payload) => payload,
+        Err(error) => {
+            ::zeroclaw_log::record!(
+                WARN,
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Reject)
+                    .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                    .with_attrs(::serde_json::json!({"error": error.to_string()})),
+                "Lark webhook: invalid or undecryptable payload"
+            );
+            return (StatusCode::BAD_REQUEST, "invalid webhook payload").into_response();
+        }
+    };
+    let encrypted = lark_webhook_is_encrypted(&raw_payload);
+    if encrypted
+        && !verify_lark_webhook_request(
+            &state.verification_token,
+            state.channel.encrypt_key.as_deref(),
+            &headers,
+            &body,
+            &raw_payload,
+        )
+    {
+        ::zeroclaw_log::record!(
+            WARN,
+            ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Reject)
+                .with_outcome(::zeroclaw_log::EventOutcome::Unknown),
+            "Lark webhook: invalid authentication"
+        );
+        return (StatusCode::UNAUTHORIZED, "invalid authentication").into_response();
+    }
+
     let decrypted_body =
         match decrypt_lark_webhook_body(&body, state.channel.encrypt_key.as_deref()) {
             Ok(body) => body,
@@ -925,13 +960,14 @@ async fn handle_lark_http_event(
         }
     };
 
-    let authenticated = verify_lark_webhook_request(
-        &state.verification_token,
-        state.channel.encrypt_key.as_deref(),
-        &headers,
-        &body,
-        &payload,
-    );
+    let authenticated = encrypted
+        || verify_lark_webhook_request(
+            &state.verification_token,
+            state.channel.encrypt_key.as_deref(),
+            &headers,
+            &body,
+            &payload,
+        );
 
     if let Some(challenge_value) = payload.get("challenge") {
         let Some(challenge) = challenge_value.as_str() else {
@@ -6385,9 +6421,9 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn webhook_card_action_authenticates_before_resolving_approval() {
+    async fn webhook_card_action_authenticates_before_decrypting_and_resolving_approval() {
         use axum::{
-            body::Bytes,
+            body::{Bytes, to_bytes},
             extract::State,
             http::{HeaderMap, HeaderValue, StatusCode},
         };
@@ -6453,6 +6489,7 @@ mod tests {
         let (wrong_chat_tx, _wrong_chat_rx) = tokio::sync::oneshot::channel();
         let (unauthorized_tx, _unauthorized_rx) = tokio::sync::oneshot::channel();
         let (forged_tx, mut forged_rx) = tokio::sync::oneshot::channel();
+        let (tampered_tx, mut tampered_rx) = tokio::sync::oneshot::channel();
         let (encrypted_tx, encrypted_rx) = tokio::sync::oneshot::channel();
         {
             let mut approvals = channel.pending_approvals.lock().await;
@@ -6461,6 +6498,7 @@ mod tests {
                 ("WRONG001", wrong_chat_tx, "oc_origin"),
                 ("OTHER001", unauthorized_tx, "oc_origin"),
                 ("FORGED01", forged_tx, "oc_origin"),
+                ("TAMPER01", tampered_tx, "oc_origin"),
                 ("ENCRYPT1", encrypted_tx, "oc_origin"),
             ] {
                 approvals.insert(
@@ -6546,6 +6584,42 @@ mod tests {
                 .await
                 .is_err(),
             "card actions must not be emitted as ordinary channel messages"
+        );
+
+        let tampered_envelope = envelope("TAMPER01", "ou_testuser123", "oc_origin", "approve");
+        let mut invalid_padding_body = encrypted_body(
+            &serde_json::to_vec(&tampered_envelope).unwrap(),
+            "test_encrypt_key",
+        );
+        let mut invalid_padding_envelope: serde_json::Value =
+            serde_json::from_slice(&invalid_padding_body).unwrap();
+        let mut ciphertext = base64::engine::general_purpose::STANDARD
+            .decode(invalid_padding_envelope["encrypt"].as_str().unwrap())
+            .unwrap();
+        *ciphertext.last_mut().unwrap() ^= 0xff;
+        invalid_padding_envelope["encrypt"] =
+            serde_json::json!(base64::engine::general_purpose::STANDARD.encode(ciphertext));
+        invalid_padding_body = serde_json::to_vec(&invalid_padding_envelope).unwrap();
+
+        let padding_valid_non_json_body = encrypted_body(b"not JSON", "test_encrypt_key");
+        for body in [invalid_padding_body, padding_valid_non_json_body] {
+            let response =
+                handle_lark_http_event(State(state.clone()), HeaderMap::new(), Bytes::from(body))
+                    .await;
+            assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+            let response_body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+            assert_eq!(response_body.as_ref(), b"invalid authentication");
+        }
+        assert!(matches!(
+            tampered_rx.try_recv(),
+            Err(tokio::sync::oneshot::error::TryRecvError::Empty)
+        ));
+        assert!(
+            channel
+                .pending_approvals
+                .lock()
+                .await
+                .contains_key("TAMPER01")
         );
 
         let encrypted_envelope = envelope("ENCRYPT1", "ou_testuser123", "oc_origin", "approve");
