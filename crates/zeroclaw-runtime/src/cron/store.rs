@@ -57,17 +57,6 @@ pub(crate) fn finish_agent_claim(config: &Config, job_id: &str, lock_token: &str
     ));
 }
 
-fn live_agent_claim_tokens(config: &Config) -> HashSet<String> {
-    let claims = LIVE_AGENT_CLAIM_TOKENS
-        .lock()
-        .unwrap_or_else(|e| e.into_inner());
-    let db_path = cron_db_path(config);
-    claims
-        .iter()
-        .filter_map(|(path, _, token)| (path == &db_path).then_some(token.clone()))
-        .collect()
-}
-
 #[cfg(test)]
 pub(crate) fn force_release_failure_for_tests(config: &Config, enabled: bool) {
     let mut failures = FORCED_RELEASE_FAILURES
@@ -1007,8 +996,23 @@ pub fn release_job(config: &Config, job_id: &str) -> Result<()> {
     })
 }
 
-pub fn clear_stale_locks(config: &Config) -> Result<usize> {
-    let live_tokens = live_agent_claim_tokens(config);
+fn clear_stale_locks_inner(config: &Config, before_update: impl FnOnce()) -> Result<usize> {
+    // Keep the registry lock through the snapshot and the cleanup UPDATE. A
+    // new manual claim registers its token before writing the row; holding the
+    // same lock here makes that admission wait until recovery has finished, so
+    // recovery cannot clear a claim that was admitted during its stale-token
+    // snapshot.
+    let claims = LIVE_AGENT_CLAIM_TOKENS
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    let db_path = cron_db_path(config);
+    let live_tokens = claims
+        .iter()
+        .filter_map(|(path, _, token)| (path == &db_path).then_some(token.clone()))
+        .collect::<HashSet<_>>();
+
+    before_update();
+
     let cleared = with_read_connection(config, |conn| {
         let changed = if live_tokens.is_empty() {
             conn.execute(
@@ -1032,6 +1036,10 @@ pub fn clear_stale_locks(config: &Config) -> Result<usize> {
         Ok(changed)
     })?;
     Ok(cleared.unwrap_or(0))
+}
+
+pub fn clear_stale_locks(config: &Config) -> Result<usize> {
+    clear_stale_locks_inner(config, || {})
 }
 
 pub fn record_run(
@@ -2402,6 +2410,52 @@ mod tests {
             .expect("agent claim should win");
         assert_eq!(clear_stale_locks(&config).unwrap(), 0);
         assert!(due_jobs(&config, now).unwrap().is_empty());
+        assert!(release_job_for_token(&config, &job.id, &token).unwrap());
+    }
+
+    #[test]
+    fn clear_stale_locks_serializes_new_agent_claims() {
+        let tmp = TempDir::new().unwrap();
+        let config = std::sync::Arc::new(test_config(&tmp));
+        let job = add_job(&config, "owner-agent", "*/5 * * * *", "echo ok").unwrap();
+        let now = Utc::now();
+
+        // A legacy/scheduled claim has no token and is eligible for startup
+        // recovery. The concurrent agent claim must not be able to register
+        // and write its replacement while recovery is between its snapshot and
+        // cleanup UPDATE.
+        assert!(claim_job(&config, &job.id, now).unwrap());
+
+        let (started_tx, started_rx) = std::sync::mpsc::channel();
+        let (go_tx, go_rx) = std::sync::mpsc::channel();
+        let claim_config = config.clone();
+        let claim_job_id = job.id.clone();
+        let claim_thread = std::thread::spawn(move || {
+            started_tx.send(()).unwrap();
+            go_rx.recv().unwrap();
+            claim_job_for_agent_with_token(&claim_config, &claim_job_id, "owner-agent", Utc::now())
+        });
+
+        let cleared = clear_stale_locks_inner(&config, || {
+            started_rx.recv().unwrap();
+            go_tx.send(()).unwrap();
+
+            // `claim_job_for_agent_with_token` has been released to run, but
+            // its registration must wait for recovery's registry guard.
+            assert!(LIVE_AGENT_CLAIM_TOKENS.try_lock().is_err());
+        })
+        .unwrap();
+        assert_eq!(cleared, 1, "the pre-existing stale claim should be cleared");
+
+        let token = claim_thread
+            .join()
+            .unwrap()
+            .unwrap()
+            .expect("the new claim should win after recovery");
+        assert!(
+            !claim_job_for_agent(&config, &job.id, "owner-agent", Utc::now()).unwrap(),
+            "a second execution must remain blocked by the admitted claim"
+        );
         assert!(release_job_for_token(&config, &job.id, &token).unwrap());
     }
 
