@@ -7371,7 +7371,8 @@ data: [DONE]\n\n";
         let session_key = format!("{GW_SESSION_PREFIX}{session_id}");
 
         let (mut websocket, _) = connect_async(format!(
-            "ws://{gateway_addr}/ws/chat?agent=web&session_id={session_id}"
+            // This URL connects only to the test's loopback listener.
+            "ws://{gateway_addr}/ws/chat?agent=web&session_id={session_id}" // nosemgrep: javascript.lang.security.detect-insecure-websocket.detect-insecure-websocket
         ))
         .await
         .expect("WS transport upgrade");
@@ -7462,7 +7463,8 @@ data: [DONE]\n\n";
 
         let (gateway_addr, gateway_server) = spawn_test_ws_gateway(state.clone()).await;
         let (mut websocket, _) = connect_async(format!(
-            "ws://{gateway_addr}/ws/chat?agent=web&session_id={session_id}"
+            // This URL connects only to the test's loopback listener.
+            "ws://{gateway_addr}/ws/chat?agent=web&session_id={session_id}" // nosemgrep: javascript.lang.security.detect-insecure-websocket.detect-insecure-websocket
         ))
         .await
         .expect("WS transport upgrade");
