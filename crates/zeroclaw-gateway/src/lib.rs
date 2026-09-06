@@ -84,7 +84,20 @@ use std::collections::HashMap;
 use std::net::{IpAddr, SocketAddr};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
-use ws::GW_SESSION_PREFIX;
+
+/// Gateway session key prefix to avoid collisions with channel sessions.
+pub(crate) const GW_SESSION_PREFIX: &str = "gw_";
+
+/// Return the canonical persistence and cancellation key for a gateway session.
+///
+/// WebSocket, webhook SSE, and API abort handling share this derivation so an
+/// accepted display session id always addresses the same in-flight turn.
+pub(crate) fn gateway_session_key(session_id: &str) -> String {
+    format!(
+        "{GW_SESSION_PREFIX}{}",
+        zeroclaw_api::session_keys::sanitize_session_key(session_id)
+    )
+}
 
 /// Backoff after a transient `accept()` error so the serve loop does not
 /// hot-spin while the condition (e.g. fd exhaustion) clears.
@@ -3345,12 +3358,9 @@ async fn run_gateway_chat_streaming_response(
 
     // Register under the gateway session key so the existing abort endpoint
     // (and the shared cancellation registry) can cancel the in-flight turn.
-    let session_key = format!(
-        "{GW_SESSION_PREFIX}{}",
-        session_id
-            .map(zeroclaw_api::session_keys::sanitize_session_key)
-            .unwrap_or_else(|| uuid::Uuid::new_v4().to_string())
-    );
+    let session_key = session_id
+        .map(gateway_session_key)
+        .unwrap_or_else(|| gateway_session_key(&uuid::Uuid::new_v4().to_string()));
     register_cancel_token(
         &state.cancel_tokens,
         &session_key,
@@ -7522,8 +7532,8 @@ data: [DONE]\n\n";
         let tmp = tempfile::tempdir().expect("transport test temp dir");
         let (state, _) = production_sse_state(&tmp, &fixture.base_url(), 1.0, false);
         let (gateway_addr, gateway_server) = spawn_test_ws_gateway(state.clone()).await;
-        let session_id = "transport-ws-to-sse";
-        let session_key = format!("{GW_SESSION_PREFIX}{session_id}");
+        let session_id = "transport.ws-to.sse";
+        let session_key = gateway_session_key(session_id);
 
         // This URL connects only to the test's loopback listener. Keep the
         // scheme split so the static insecure-transport rule does not flag a
@@ -7570,9 +7580,21 @@ data: [DONE]\n\n";
             .expect("SSE registration cancels the replaced WS turn");
         wait_for_registry_owner(&state, &session_key, &sse_token).await;
 
-        // The replacement SSE turn is still the only live owner. Cancel it and
-        // consume the body so its terminal error and owner-qualified cleanup run.
-        sse_token.cancel();
+        // The dotted display id must resolve to the canonical key and cancel
+        // the replacement SSE turn, not the original WebSocket turn.
+        let abort_response = api::handle_api_session_abort(
+            State(state.clone()),
+            HeaderMap::new(),
+            axum::extract::Path(session_id.to_string()),
+        )
+        .await
+        .into_response();
+        assert_eq!(abort_response.status(), StatusCode::OK);
+        tokio::time::timeout(Duration::from_secs(3), sse_token.cancelled())
+            .await
+            .expect("abort endpoint cancels the replacement SSE turn");
+
+        // Consume the body so its terminal error and owner-qualified cleanup run.
         let sse_text = collect_cancelled_sse(sse_response).await;
         assert!(
             sse_text.contains("event: error"),

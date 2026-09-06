@@ -4,7 +4,7 @@
 //! key-name redaction heuristic. Approval decisions bind to `request_id`; this
 //! transport forwards the summary without rebuilding it from raw arguments.
 
-use super::{AppState, register_cancel_token, remove_cancel_token_if_current};
+use super::{AppState, gateway_session_key, register_cancel_token, remove_cancel_token_if_current};
 use crate::ws_approval::{PendingApprovals, WsApprovalChannel, new_pending_approvals};
 use axum::{
     extract::{
@@ -197,9 +197,6 @@ pub async fn handle_ws_chat(
     .into_response()
 }
 
-/// Gateway session key prefix to avoid collisions with channel sessions.
-pub(crate) const GW_SESSION_PREFIX: &str = "gw_";
-
 fn websocket_ping_interval(
     config: &zeroclaw_config::schema::Config,
 ) -> Option<tokio::time::Interval> {
@@ -349,7 +346,7 @@ async fn handle_socket(
 
     // Resolve session ID: use provided or generate a new UUID
     let session_id = session_id.unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
-    let session_key = format!("{GW_SESSION_PREFIX}{session_id}");
+    let session_key = gateway_session_key(&session_id);
     // Match the sanitized form persisted by memory backend migrations.
     let mut memory_session_id = zeroclaw_api::session_keys::sanitize_session_key(&session_id);
 

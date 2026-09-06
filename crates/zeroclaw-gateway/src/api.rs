@@ -1,7 +1,7 @@
 //! REST API handlers for the web dashboard.
 //! All `/api/*` routes require bearer token authentication (PairingGuard).
 
-use super::AppState;
+use super::{AppState, GW_SESSION_PREFIX, gateway_session_key};
 use axum::{
     extract::{Path, Query, State},
     http::{HeaderMap, StatusCode, header},
@@ -1761,18 +1761,20 @@ pub async fn handle_api_sessions_list(
 /// clients may pick display ids that contain `_`, e.g. `team_alpha` →
 /// `gw_team_alpha`):
 /// 1. exact `id` if it already exists as a session/cancel key
-/// 2. `gw_{id}` if that exists
-/// 3. namespace fallback: keep a `gw_`-prefixed id as-is; otherwise prefix `gw_`
+/// 2. legacy raw `gw_{id}` if it already exists
+/// 3. the canonical sanitized gateway key
+/// 4. namespace fallback: keep a `gw_`-prefixed id as-is; otherwise use the
+///    canonical sanitized gateway key
 fn resolve_gateway_session_key(id: &str, exists: impl Fn(&str) -> bool) -> String {
     if exists(id) {
         return id.to_string();
     }
     if !id.starts_with("gw_") {
-        let prefixed = format!("gw_{id}");
-        if exists(&prefixed) {
-            return prefixed;
+        let legacy_key = format!("{GW_SESSION_PREFIX}{id}");
+        if exists(&legacy_key) {
+            return legacy_key;
         }
-        return prefixed;
+        return gateway_session_key(id);
     }
     id.to_string()
 }
@@ -3606,6 +3608,18 @@ pub(crate) mod tests {
             resolve_gateway_session_key("team_alpha", both),
             "team_alpha"
         );
+
+        let legacy_dotted = |key: &str| key == "gw_team.alpha";
+        assert_eq!(
+            resolve_gateway_session_key("team.alpha", legacy_dotted),
+            "gw_team.alpha",
+            "existing raw gateway keys remain addressable"
+        );
+        assert_eq!(
+            resolve_gateway_session_key("team.alpha", none),
+            "gw_team_alpha",
+            "new dotted display ids use the canonical sanitized gateway key"
+        );
     }
 
     #[test]
@@ -3699,6 +3713,33 @@ pub(crate) mod tests {
             json["status"], "aborted",
             "underscore display ids must resolve to gw_ + id, not the bare id"
         );
+        assert!(token.is_cancelled());
+    }
+
+    #[tokio::test]
+    async fn session_abort_accepts_dotted_display_session_id() {
+        let state = test_state(zeroclaw_config::schema::Config::default());
+        let token = tokio_util::sync::CancellationToken::new();
+        state
+            .cancel_tokens
+            .lock()
+            .expect("cancel_tokens lock")
+            .insert(
+                gateway_session_key("team.alpha"),
+                std::sync::Arc::new(token.clone()),
+            );
+
+        let response = handle_api_session_abort(
+            State(state),
+            HeaderMap::new(),
+            Path("team.alpha".to_string()),
+        )
+        .await
+        .into_response();
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let json = response_json(response).await;
+        assert_eq!(json["status"], "aborted");
         assert!(token.is_cancelled());
     }
 
