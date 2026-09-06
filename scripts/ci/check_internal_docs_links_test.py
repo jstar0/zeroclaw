@@ -65,6 +65,50 @@ class InternalDocsLinksTest(unittest.TestCase):
         )
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
 
+    def test_reports_missing_target_in_anchored_include(self) -> None:
+        result = self.run_checker(
+            {
+                "guides/index.md": "{{#include ../_snippets/shared.md:example}}\n",
+                "_snippets/shared.md": "[Missing](missing.md)\n",
+            }
+        )
+
+        self.assertEqual(result.returncode, 1)
+        self.assertIn("_snippets/shared.md:1", result.stdout)
+        self.assertIn("guides/missing.md", result.stdout)
+
+    def test_resolves_nested_include_links_from_rendered_page(self) -> None:
+        result = self.run_checker(
+            {
+                "guides/index.md": "{{#include ../_snippets/outer.md}}\n",
+                "guides/guide.md": "# Guide\n",
+                "_snippets/outer.md": "{{#include inner.md}}\n",
+                "_snippets/inner.md": "[Guide](guide.md)\n",
+            }
+        )
+
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+
+    def test_ignores_inline_and_nested_fenced_examples_but_checks_following_link(self) -> None:
+        result = self.run_checker(
+            {
+                "index.md": (
+                    "`[Inline](inline-placeholder.md)`\n"
+                    "````md\n"
+                    "```md\n"
+                    "[Example](fenced-placeholder.md)\n"
+                    "```\n"
+                    "````\n"
+                    "[Missing](missing-after-fence.md)\n"
+                ),
+            }
+        )
+
+        self.assertEqual(result.returncode, 1)
+        self.assertIn("missing-after-fence.md", result.stdout)
+        self.assertNotIn("inline-placeholder.md", result.stdout)
+        self.assertNotIn("fenced-placeholder.md", result.stdout)
+
 
 if __name__ == "__main__":
     unittest.main()
