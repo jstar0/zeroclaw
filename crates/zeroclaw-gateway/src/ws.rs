@@ -4,7 +4,10 @@
 //! key-name redaction heuristic. Approval decisions bind to `request_id`; this
 //! transport forwards the summary without rebuilding it from raw arguments.
 
-use super::{AppState, gateway_session_key, register_cancel_token, remove_cancel_token_if_current};
+use super::{
+    AppState, GW_SESSION_PREFIX, gateway_session_key, register_cancel_token,
+    remove_cancel_token_if_current,
+};
 use crate::ws_approval::{PendingApprovals, WsApprovalChannel, new_pending_approvals};
 use axum::{
     extract::{
@@ -346,7 +349,10 @@ async fn handle_socket(
 
     // Resolve session ID: use provided or generate a new UUID
     let session_id = session_id.unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
-    let session_key = gateway_session_key(&session_id);
+    // Transcript identity keeps the raw display id (`gw_{session_id}`) so
+    // existing persisted histories and metadata rows stay resumable across
+    // reconnects.
+    let session_key = format!("{GW_SESSION_PREFIX}{session_id}");
     // Match the sanitized form persisted by memory backend migrations.
     let mut memory_session_id = zeroclaw_api::session_keys::sanitize_session_key(&session_id);
 
@@ -1044,9 +1050,15 @@ async fn process_chat_message(
     // ── Cancellation token lifecycle ─────────────────────────────
     // Create a token before the turn starts so the abort endpoint
     // can cancel it. Remove it after the turn completes regardless
-    // of outcome (normal, error, or cancelled).
+    // of outcome (normal, error, or cancelled). Registration uses the
+    // canonical sanitized cancellation key shared with the webhook SSE
+    // transport, while persistence stays on the raw transcript key.
     let cancel_token = Arc::new(tokio_util::sync::CancellationToken::new());
-    register_cancel_token(&state.cancel_tokens, session_key, Arc::clone(&cancel_token));
+    register_cancel_token(
+        &state.cancel_tokens,
+        &gateway_session_key(session_id),
+        Arc::clone(&cancel_token),
+    );
 
     // Channel for streaming turn events from the agent.
     let (event_tx, mut event_rx) = tokio::sync::mpsc::channel::<TurnEvent>(64);
@@ -1295,7 +1307,11 @@ async fn process_chat_message(
     let (result, ()) = tokio::join!(turn_fut, forward_fut);
 
     // ── Remove cancel token (turn finished) ──────────────────────
-    remove_cancel_token_if_current(&state.cancel_tokens, session_key, &cancel_token);
+    remove_cancel_token_if_current(
+        &state.cancel_tokens,
+        &gateway_session_key(session_id),
+        &cancel_token,
+    );
 
     // Check if this turn was cancelled. `turn_streamed` propagates
     // `ToolLoopCancelled` through anyhow, so we detect it here.

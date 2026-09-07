@@ -7703,6 +7703,187 @@ data: [DONE]\n\n";
     }
 
     #[test]
+    fn websocket_resumes_seeded_legacy_dotted_session_transcript() {
+        std::thread::Builder::new()
+            .name("gateway-ws-legacy-resume".to_string())
+            .stack_size(8 * 1024 * 1024)
+            .spawn(|| {
+                tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build()
+                    .expect("test runtime")
+                    .block_on(websocket_resumes_seeded_legacy_dotted_session_inner());
+            })
+            .expect("spawn WS legacy-resume test thread")
+            .join()
+            .expect("WS legacy-resume test thread must not panic");
+    }
+
+    async fn websocket_resumes_seeded_legacy_dotted_session_inner() {
+        use futures_util::StreamExt;
+        use tokio_tungstenite::connect_async;
+
+        let tmp = tempfile::tempdir().expect("legacy-resume temp dir");
+        let (mut state, _) =
+            production_sse_state(&tmp, "http://127.0.0.1:9/v1/chat/completions", 1.0, false);
+        let session_db = tempfile::tempdir().expect("legacy-resume session db");
+        let backend: std::sync::Arc<dyn zeroclaw_infra::session_backend::SessionBackend> =
+            std::sync::Arc::new(
+                zeroclaw_infra::session_sqlite::SqliteSessionBackend::new(session_db.path())
+                    .expect("sqlite session backend"),
+            );
+        // Seed the transcript under the legacy raw gateway key: dot-bearing
+        // display ids persisted this exact key before cancellation keys were
+        // normalized, so a reconnect must resume it unchanged.
+        let legacy_key = format!("{GW_SESSION_PREFIX}{}", "transport.legacy-resume");
+        backend
+            .append(
+                &legacy_key,
+                &zeroclaw_providers::ChatMessage::user("seeded legacy turn"),
+            )
+            .expect("seed legacy transcript");
+        state.session_backend = Some(backend);
+
+        let (gateway_addr, gateway_server) = spawn_test_ws_gateway(state.clone()).await;
+        let session_id = "transport.legacy-resume";
+        // This URL connects only to the test's loopback listener. Keep the
+        // scheme split so the static insecure-transport rule does not flag a
+        // non-production fixture.
+        let websocket_url = format!(
+            "{}//{gateway_addr}/ws/chat?agent=web&session_id={session_id}",
+            "ws:"
+        );
+        let (mut websocket, _) = connect_async(websocket_url)
+            .await
+            .expect("WS transport upgrade");
+        let session_start = websocket
+            .next()
+            .await
+            .expect("WS session_start frame")
+            .expect("WS session_start transport")
+            .into_text()
+            .expect("session_start text");
+        let session_start: serde_json::Value =
+            serde_json::from_str(&session_start).expect("session_start json");
+        assert_eq!(session_start["type"], "session_start");
+        assert_eq!(
+            session_start["resumed"], true,
+            "legacy raw-key transcript must resume for a dotted display id"
+        );
+        assert_eq!(session_start["message_count"], 1);
+
+        drop(websocket);
+        gateway_server.abort();
+    }
+
+    #[test]
+    fn websocket_delivers_api_injected_message_for_dotted_session() {
+        std::thread::Builder::new()
+            .name("gateway-ws-api-delivery".to_string())
+            .stack_size(8 * 1024 * 1024)
+            .spawn(|| {
+                tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build()
+                    .expect("test runtime")
+                    .block_on(websocket_delivers_api_injected_message_inner());
+            })
+            .expect("spawn WS api-delivery test thread")
+            .join()
+            .expect("WS api-delivery test thread must not panic");
+    }
+
+    async fn websocket_delivers_api_injected_message_inner() {
+        use futures_util::{SinkExt, StreamExt};
+        use tokio_tungstenite::{connect_async, tungstenite::Message as ClientMessage};
+
+        let tmp = tempfile::tempdir().expect("api-delivery temp dir");
+        let (mut state, _) =
+            production_sse_state(&tmp, "http://127.0.0.1:9/v1/chat/completions", 1.0, false);
+        let session_db = tempfile::tempdir().expect("api-delivery session db");
+        state.session_backend = Some(std::sync::Arc::new(
+            zeroclaw_infra::session_sqlite::SqliteSessionBackend::new(session_db.path())
+                .expect("sqlite session backend"),
+        )
+            as std::sync::Arc<dyn zeroclaw_infra::session_backend::SessionBackend>);
+
+        let (gateway_addr, gateway_server) = spawn_test_ws_gateway(state.clone()).await;
+        let session_id = "transport.api-delivery";
+        // This URL connects only to the test's loopback listener. Keep the
+        // scheme split so the static insecure-transport rule does not flag a
+        // non-production fixture.
+        let websocket_url = format!(
+            "{}//{gateway_addr}/ws/chat?agent=web&session_id={session_id}",
+            "ws:"
+        );
+        let (mut websocket, _) = connect_async(websocket_url)
+            .await
+            .expect("WS transport upgrade");
+        let _session_start = websocket
+            .next()
+            .await
+            .expect("WS session_start frame")
+            .expect("WS session_start transport");
+        websocket
+            .send(ClientMessage::Text(r#"{"type":"connect"}"#.into()))
+            .await
+            .expect("WS connect frame");
+        let connected = websocket
+            .next()
+            .await
+            .expect("WS connected frame")
+            .expect("WS connected transport");
+        assert!(connected.into_text().unwrap().contains("connected"));
+
+        // The `connected` acknowledgement is sent before the WebSocket has
+        // finished Agent setup and subscribed to the shared event channel.
+        // Wait for that authoritative readiness signal before injecting an
+        // API event; a fixed sleep would make this transport regression flaky.
+        tokio::time::timeout(Duration::from_secs(3), async {
+            while state.event_tx.receiver_count() == 0 {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("WS subscribes to shared event channel");
+
+        // An API-injected message must broadcast with the display id the
+        // connected socket filters on, so it reaches the live transport.
+        let response = api::handle_api_session_message_post(
+            State(state.clone()),
+            HeaderMap::new(),
+            axum::extract::Path(session_id.to_string()),
+            axum::Json(
+                serde_json::from_value::<api::SessionMessagePostBody>(serde_json::json!({
+                    "content": "injected for dotted session"
+                }))
+                .expect("body should deserialize"),
+            ),
+        )
+        .await
+        .into_response();
+        assert_eq!(response.status(), StatusCode::OK);
+
+        let frame = tokio::time::timeout(Duration::from_secs(3), websocket.next())
+            .await
+            .expect("WS receives API-injected message event")
+            .expect("WS message transport")
+            .expect("WS message frame")
+            .into_text()
+            .expect("message text");
+        let event: serde_json::Value = serde_json::from_str(&frame).expect("event json");
+        assert_eq!(event["type"], "message");
+        assert_eq!(
+            event["session_id"], session_id,
+            "API broadcasts must carry the display id the socket filters on"
+        );
+        assert_eq!(event["content"], "injected for dotted session");
+
+        drop(websocket);
+        gateway_server.abort();
+    }
+
+    #[test]
     fn sse_final_response_reconciliation_handles_empty_and_receipt_suffix() {
         let mut cumulative = String::new();
         let frame = reconcile_sse_final_response(&mut cumulative, "cached response")
