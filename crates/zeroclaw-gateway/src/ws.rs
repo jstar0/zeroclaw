@@ -5,7 +5,7 @@
 //! transport forwards the summary without rebuilding it from raw arguments.
 
 use super::{
-    AppState, GW_SESSION_PREFIX, gateway_session_key, register_cancel_token,
+    AppState, GW_SESSION_PREFIX, gateway_cancel_key, register_cancel_token,
     remove_cancel_token_if_current,
 };
 use crate::ws_approval::{PendingApprovals, WsApprovalChannel, new_pending_approvals};
@@ -1051,12 +1051,12 @@ async fn process_chat_message(
     // Create a token before the turn starts so the abort endpoint
     // can cancel it. Remove it after the turn completes regardless
     // of outcome (normal, error, or cancelled). Registration uses the
-    // canonical sanitized cancellation key shared with the webhook SSE
-    // transport, while persistence stays on the raw transcript key.
+    // process-local cancellation key shared with the webhook SSE transport,
+    // while persistence stays on the raw transcript key.
     let cancel_token = Arc::new(tokio_util::sync::CancellationToken::new());
     register_cancel_token(
         &state.cancel_tokens,
-        &gateway_session_key(session_id),
+        &gateway_cancel_key(session_id),
         Arc::clone(&cancel_token),
     );
 
@@ -1309,7 +1309,7 @@ async fn process_chat_message(
     // ── Remove cancel token (turn finished) ──────────────────────
     remove_cancel_token_if_current(
         &state.cancel_tokens,
-        &gateway_session_key(session_id),
+        &gateway_cancel_key(session_id),
         &cancel_token,
     );
 

@@ -88,15 +88,25 @@ use std::time::{Duration, Instant};
 /// Gateway session key prefix to avoid collisions with channel sessions.
 pub(crate) const GW_SESSION_PREFIX: &str = "gw_";
 
-/// Return the canonical persistence and cancellation key for a gateway session.
+/// Return the canonical persistence key for a gateway session.
 ///
-/// WebSocket, webhook SSE, and API abort handling share this derivation so an
-/// accepted display session id always addresses the same in-flight turn.
+/// Persistence backends apply the shared filesystem-safe normalization so
+/// their in-memory and on-disk keys remain consistent.
 pub(crate) fn gateway_session_key(session_id: &str) -> String {
     format!(
         "{GW_SESSION_PREFIX}{}",
         zeroclaw_api::session_keys::sanitize_session_key(session_id)
     )
+}
+
+/// Return the process-local cancellation key for a gateway session.
+///
+/// Unlike persistence keys, cancellation keys must preserve the accepted
+/// session id verbatim: filesystem-safe normalization is lossy and would make
+/// distinct live sessions such as `team.alpha` and `team_alpha` cancel one
+/// another.
+pub(crate) fn gateway_cancel_key(session_id: &str) -> String {
+    format!("{GW_SESSION_PREFIX}{session_id}")
 }
 
 /// Backoff after a transient `accept()` error so the serve loop does not
@@ -3307,7 +3317,7 @@ struct SseClientStream {
             std::collections::HashMap<String, Arc<tokio_util::sync::CancellationToken>>,
         >,
     >,
-    session_key: String,
+    cancel_key: String,
 }
 
 impl futures_util::Stream for SseClientStream {
@@ -3324,7 +3334,7 @@ impl futures_util::Stream for SseClientStream {
 impl Drop for SseClientStream {
     fn drop(&mut self) {
         self.cancel_token.cancel();
-        remove_cancel_token_if_current(&self.cancel_tokens, &self.session_key, &self.cancel_token);
+        remove_cancel_token_if_current(&self.cancel_tokens, &self.cancel_key, &self.cancel_token);
     }
 }
 
@@ -3356,16 +3366,23 @@ async fn run_gateway_chat_streaming_response(
     let (event_tx, mut event_rx) = tokio::sync::mpsc::channel::<zeroclaw_api::agent::TurnEvent>(64);
     let cancel_token = Arc::new(tokio_util::sync::CancellationToken::new());
 
-    // Register under the gateway session key so the existing abort endpoint
-    // (and the shared cancellation registry) can cancel the in-flight turn.
-    let session_key = session_id
-        .map(gateway_session_key)
-        .unwrap_or_else(|| gateway_session_key(&uuid::Uuid::new_v4().to_string()));
-    register_cancel_token(
-        &state.cancel_tokens,
-        &session_key,
-        Arc::clone(&cancel_token),
-    );
+    // Register under the process-local cancellation key so the existing abort
+    // endpoint (and the shared cancellation registry) can cancel the
+    // in-flight turn without collapsing distinct display ids.
+    let (session_key, cancel_key) = match session_id {
+        Some(session_id) => (
+            gateway_session_key(session_id),
+            gateway_cancel_key(session_id),
+        ),
+        None => {
+            let generated_session_id = uuid::Uuid::new_v4().to_string();
+            (
+                gateway_session_key(&generated_session_id),
+                gateway_cancel_key(&generated_session_id),
+            )
+        }
+    };
+    register_cancel_token(&state.cancel_tokens, &cancel_key, Arc::clone(&cancel_token));
 
     let (frame_tx, frame_rx) = tokio::sync::mpsc::channel::<SseFrame>(16);
     let (turn_tx, turn_rx) = tokio::sync::oneshot::channel::<anyhow::Result<String>>();
@@ -3391,7 +3408,7 @@ async fn run_gateway_chat_streaming_response(
     });
 
     let state_for_frames = state.clone();
-    let session_for_frames = session_key.clone();
+    let cancel_key_for_frames = cancel_key.clone();
     let token_for_stream = Arc::clone(&cancel_token);
     zeroclaw_spawn::spawn!(async move {
         let mut cumulative = String::new();
@@ -3405,7 +3422,7 @@ async fn run_gateway_chat_streaming_response(
                             cancel_token.cancel();
                             remove_cancel_token_if_current(
                                 &state_for_frames.cancel_tokens,
-                                &session_for_frames,
+                                &cancel_key_for_frames,
                                 &cancel_token,
                             );
                             return;
@@ -3427,7 +3444,7 @@ async fn run_gateway_chat_streaming_response(
                     let _ = frame_tx.send(sse_error_frame(&message)).await;
                     remove_cancel_token_if_current(
                         &state_for_frames.cancel_tokens,
-                        &session_for_frames,
+                        &cancel_key_for_frames,
                         &cancel_token,
                     );
                     return;
@@ -3439,7 +3456,7 @@ async fn run_gateway_chat_streaming_response(
             .unwrap_or_else(|e| Err(anyhow::Error::msg(e.to_string())));
         remove_cancel_token_if_current(
             &state_for_frames.cancel_tokens,
-            &session_for_frames,
+            &cancel_key_for_frames,
             &cancel_token,
         );
         state_for_frames.observer.record_metric(
@@ -3470,7 +3487,7 @@ async fn run_gateway_chat_streaming_response(
         receiver: frame_rx,
         cancel_token: token_for_stream,
         cancel_tokens: Arc::clone(&state.cancel_tokens),
-        session_key,
+        cancel_key,
     })
     .keep_alive(SseKeepAlive::default());
     (
@@ -4599,6 +4616,16 @@ mod tests {
             },
         );
         assert_eq!(default_agent_alias(&config).as_deref(), Some("alpha"));
+    }
+
+    #[test]
+    fn gateway_cancel_key_preserves_distinct_session_ids() {
+        let dotted = gateway_cancel_key("team.alpha");
+        let underscored = gateway_cancel_key("team_alpha");
+
+        assert_eq!(dotted, "gw_team.alpha");
+        assert_eq!(underscored, "gw_team_alpha");
+        assert_ne!(dotted, underscored);
     }
 
     /// Generate a random hex secret at runtime to avoid hard-coded cryptographic values.
@@ -7533,7 +7560,7 @@ data: [DONE]\n\n";
         let (state, _) = production_sse_state(&tmp, &fixture.base_url(), 1.0, false);
         let (gateway_addr, gateway_server) = spawn_test_ws_gateway(state.clone()).await;
         let session_id = "transport.ws-to.sse";
-        let session_key = gateway_session_key(session_id);
+        let session_key = gateway_cancel_key(session_id);
 
         // This URL connects only to the test's loopback listener. Keep the
         // scheme split so the static insecure-transport rule does not flag a
@@ -7965,6 +7992,32 @@ data: [DONE]\n\n";
             .expect("replacement WS token remains registered");
         assert!(Arc::ptr_eq(&current, &ws_token));
         assert!(!ws_token.is_cancelled());
+    }
+
+    #[test]
+    fn cancellation_registry_keeps_lossy_session_ids_separate() {
+        let registry = Arc::new(std::sync::Mutex::new(HashMap::new()));
+        let dotted_token = Arc::new(tokio_util::sync::CancellationToken::new());
+        let underscored_token = Arc::new(tokio_util::sync::CancellationToken::new());
+
+        register_cancel_token(
+            &registry,
+            &gateway_cancel_key("team.alpha"),
+            Arc::clone(&dotted_token),
+        );
+        register_cancel_token(
+            &registry,
+            &gateway_cancel_key("team_alpha"),
+            Arc::clone(&underscored_token),
+        );
+
+        assert!(!dotted_token.is_cancelled());
+        assert!(!underscored_token.is_cancelled());
+        assert_eq!(
+            registry.lock().expect("cancel registry lock").len(),
+            2,
+            "distinct session ids must not share a cancellation entry"
+        );
     }
 
     #[tokio::test]

@@ -3725,7 +3725,7 @@ pub(crate) mod tests {
             .lock()
             .expect("cancel_tokens lock")
             .insert(
-                gateway_session_key("team.alpha"),
+                "gw_team.alpha".to_string(),
                 std::sync::Arc::new(token.clone()),
             );
 
@@ -3741,6 +3741,126 @@ pub(crate) mod tests {
         let json = response_json(response).await;
         assert_eq!(json["status"], "aborted");
         assert!(token.is_cancelled());
+    }
+
+    #[tokio::test]
+    async fn session_abort_accepts_full_dotted_session_key() {
+        let state = test_state(zeroclaw_config::schema::Config::default());
+        let token = tokio_util::sync::CancellationToken::new();
+        state
+            .cancel_tokens
+            .lock()
+            .expect("cancel_tokens lock")
+            .insert(
+                "gw_team.alpha".to_string(),
+                std::sync::Arc::new(token.clone()),
+            );
+
+        let response = handle_api_session_abort(
+            State(state),
+            HeaderMap::new(),
+            Path("gw_team.alpha".to_string()),
+        )
+        .await
+        .into_response();
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let json = response_json(response).await;
+        assert_eq!(json["status"], "aborted");
+        assert!(token.is_cancelled());
+    }
+
+    #[tokio::test]
+    async fn session_abort_keeps_dotted_and_underscored_ids_separate() {
+        let state = test_state(zeroclaw_config::schema::Config::default());
+        let dotted_token = tokio_util::sync::CancellationToken::new();
+        let underscored_token = tokio_util::sync::CancellationToken::new();
+        state
+            .cancel_tokens
+            .lock()
+            .expect("cancel_tokens lock")
+            .insert(
+                "gw_team.alpha".to_string(),
+                std::sync::Arc::new(dotted_token.clone()),
+            );
+        state
+            .cancel_tokens
+            .lock()
+            .expect("cancel_tokens lock")
+            .insert(
+                "gw_team_alpha".to_string(),
+                std::sync::Arc::new(underscored_token.clone()),
+            );
+
+        let dotted_response = handle_api_session_abort(
+            State(state.clone()),
+            HeaderMap::new(),
+            Path("team.alpha".to_string()),
+        )
+        .await
+        .into_response();
+        assert_eq!(dotted_response.status(), StatusCode::OK);
+        assert_eq!(response_json(dotted_response).await["status"], "aborted");
+        assert!(dotted_token.is_cancelled());
+        assert!(
+            !underscored_token.is_cancelled(),
+            "aborting team.alpha must not cancel team_alpha"
+        );
+
+        let underscored_response = handle_api_session_abort(
+            State(state),
+            HeaderMap::new(),
+            Path("team_alpha".to_string()),
+        )
+        .await
+        .into_response();
+        assert_eq!(underscored_response.status(), StatusCode::OK);
+        assert_eq!(
+            response_json(underscored_response).await["status"],
+            "aborted"
+        );
+        assert!(underscored_token.is_cancelled());
+    }
+
+    #[tokio::test]
+    async fn session_delete_cancels_full_dotted_session_key() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let config = zeroclaw_config::schema::Config {
+            data_dir: tmp.path().join("workspace"),
+            config_path: tmp.path().join("config.toml"),
+            ..zeroclaw_config::schema::Config::default()
+        };
+        std::fs::create_dir_all(&config.data_dir).unwrap();
+        let backend: Arc<dyn SessionBackend> =
+            Arc::new(SqliteSessionBackend::new(tmp.path()).unwrap());
+        backend
+            .append(
+                "gw_team.alpha",
+                &zeroclaw_providers::ChatMessage::assistant("existing"),
+            )
+            .unwrap();
+        let state = test_state_with_session_backend(config, backend.clone());
+        let token = tokio_util::sync::CancellationToken::new();
+        state
+            .cancel_tokens
+            .lock()
+            .expect("cancel_tokens lock")
+            .insert("gw_team.alpha".to_string(), Arc::new(token.clone()));
+
+        let response = handle_api_session_delete(
+            State(state),
+            HeaderMap::new(),
+            Path("gw_team.alpha".to_string()),
+        )
+        .await
+        .into_response();
+
+        assert_eq!(response.status(), StatusCode::OK);
+        assert!(token.is_cancelled());
+        assert!(
+            !backend.session_exists("gw_team.alpha"),
+            "deletion must target the persisted dotted session key"
+        );
     }
 
     #[tokio::test]
