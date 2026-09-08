@@ -69,21 +69,75 @@ class InternalDocsLinksTest(unittest.TestCase):
         result = self.run_checker(
             {
                 "guides/index.md": "{{#include ../_snippets/shared.md:example}}\n",
-                "_snippets/shared.md": "[Missing](missing.md)\n",
+                "_snippets/shared.md": (
+                    "<!-- ANCHOR: example -->\n"
+                    "[Missing](missing.md)\n"
+                    "<!-- ANCHOR_END: example -->\n"
+                    "<!-- ANCHOR: other -->\n"
+                    "[Unrendered](unrendered.md)\n"
+                    "<!-- ANCHOR_END: other -->\n"
+                ),
             }
         )
 
         self.assertEqual(result.returncode, 1)
-        self.assertIn("_snippets/shared.md:1", result.stdout)
+        self.assertIn("_snippets/shared.md:2", result.stdout)
         self.assertIn("guides/missing.md", result.stdout)
+        self.assertNotIn("unrendered.md", result.stdout)
+
+    def test_scopes_anchored_links_to_each_rendered_page(self) -> None:
+        result = self.run_checker(
+            {
+                "guides/a.md": "{{#include ../_snippets/shared.md:a}}\n",
+                "guides/b.md": "{{#include ../_snippets/shared.md:b}}\n",
+                "guides/a-target.md": "# A\n",
+                "_snippets/shared.md": (
+                    "<!-- ANCHOR: a -->\n"
+                    "[A](a-target.md)\n"
+                    "<!-- ANCHOR_END: a -->\n"
+                    "<!-- ANCHOR: b -->\n"
+                    "[B](b-target.md)\n"
+                    "<!-- ANCHOR_END: b -->\n"
+                ),
+            }
+        )
+
+        self.assertEqual(result.returncode, 1)
+        self.assertEqual(result.stdout.count("guides/b-target.md"), 1)
+        self.assertNotIn("guides/a-target.md", result.stdout)
 
     def test_resolves_nested_include_links_from_rendered_page(self) -> None:
         result = self.run_checker(
             {
-                "guides/index.md": "{{#include ../_snippets/outer.md}}\n",
+                "guides/index.md": "{{#include ../_snippets/outer.md:chosen}}\n",
                 "guides/guide.md": "# Guide\n",
-                "_snippets/outer.md": "{{#include inner.md}}\n",
-                "_snippets/inner.md": "[Guide](guide.md)\n",
+                "_snippets/outer.md": (
+                    "<!-- ANCHOR: chosen -->\n"
+                    "{{#include inner.md:chosen}}\n"
+                    "<!-- ANCHOR_END: chosen -->\n"
+                    "<!-- ANCHOR: other -->\n"
+                    "{{#include inner.md:other}}\n"
+                    "<!-- ANCHOR_END: other -->\n"
+                ),
+                "_snippets/inner.md": (
+                    "<!-- ANCHOR: chosen -->\n"
+                    "[Guide](guide.md)\n"
+                    "<!-- ANCHOR_END: chosen -->\n"
+                    "<!-- ANCHOR: other -->\n"
+                    "[Missing](missing.md)\n"
+                    "<!-- ANCHOR_END: other -->\n"
+                ),
+            }
+        )
+
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+
+    def test_resolves_line_range_from_rendered_page(self) -> None:
+        result = self.run_checker(
+            {
+                "guides/index.md": "{{#include ../_snippets/shared.md:2:2}}\n",
+                "guides/guide.md": "# Guide\n",
+                "_snippets/shared.md": "ignored\n[Guide](guide.md)\n[Missing](missing.md)\n",
             }
         )
 
@@ -94,9 +148,16 @@ class InternalDocsLinksTest(unittest.TestCase):
             {
                 "index.md": (
                     "`[Inline](inline-placeholder.md)`\n"
-                    "````md\n"
+                    "`[Multiline](multiline-placeholder.md\n"
+                    "continues)`\n"
                     "```md\n"
                     "[Example](fenced-placeholder.md)\n"
+                    "``` rust\n"
+                    "[StillExample](trailing-fence-placeholder.md)\n"
+                    "```\n"
+                    "````md\n"
+                    "```md\n"
+                    "[NestedExample](nested-fenced-placeholder.md)\n"
                     "```\n"
                     "````\n"
                     "[Missing](missing-after-fence.md)\n"
@@ -107,7 +168,10 @@ class InternalDocsLinksTest(unittest.TestCase):
         self.assertEqual(result.returncode, 1)
         self.assertIn("missing-after-fence.md", result.stdout)
         self.assertNotIn("inline-placeholder.md", result.stdout)
+        self.assertNotIn("multiline-placeholder.md", result.stdout)
         self.assertNotIn("fenced-placeholder.md", result.stdout)
+        self.assertNotIn("trailing-fence-placeholder.md", result.stdout)
+        self.assertNotIn("nested-fenced-placeholder.md", result.stdout)
 
 
 if __name__ == "__main__":

@@ -13,8 +13,10 @@ from pathlib import Path
 
 INLINE_LINK_RE = re.compile(r"!?\[[^\]]*\]\(([^)]+)\)")
 REFERENCE_LINK_RE = re.compile(r"^\s*\[[^\]]+\]:\s*(\S+)")
-FENCE_RE = re.compile(r"^\s*(`{3,}|~{3,})")
+FENCE_RE = re.compile(r"^[ \t]*(`{3,}|~{3,})(.*)$")
 INCLUDE_RE = re.compile(r"\{\{#include\s+([^}\s]+)")
+ANCHOR_START_RE = re.compile(r"^[ \t]*<!--\s*ANCHOR:\s*([^\s]+)\s*-->[ \t]*$")
+ANCHOR_END_RE = re.compile(r"^[ \t]*<!--\s*ANCHOR_END:\s*([^\s]+)\s*-->[ \t]*$")
 
 
 def _strip_target(raw: str) -> str:
@@ -42,99 +44,164 @@ def _local_target(raw: str, source: Path) -> str | None:
     return resolved if resolved != "." else None
 
 
-def _strip_inline_code(line: str) -> str:
+def _backtick_run_end(line: str, start: int) -> int:
+    end = start
+    while end < len(line) and line[end] == "`":
+        end += 1
+    return end
+
+
+def _find_backtick_run(line: str, start: int, length: int) -> tuple[int, int] | None:
+    probe = start
+    while probe < len(line):
+        delimiter_start = line.find("`", probe)
+        if delimiter_start == -1:
+            return None
+        delimiter_end = _backtick_run_end(line, delimiter_start)
+        if delimiter_end - delimiter_start == length:
+            return delimiter_start, delimiter_end
+        probe = delimiter_end
+    return None
+
+
+def _strip_inline_code(line: str, inline_code_length: int | None) -> tuple[str, int | None]:
     visible: list[str] = []
     index = 0
+    active_length = inline_code_length
     while index < len(line):
+        if active_length is not None:
+            closing = _find_backtick_run(line, index, active_length)
+            if closing is None:
+                return "".join(visible), active_length
+            _, index = closing
+            active_length = None
+            continue
+
         start = line.find("`", index)
         if start == -1:
             visible.append(line[index:])
-            break
+            return "".join(visible), None
         visible.append(line[index:start])
-        delimiter_end = start
-        while delimiter_end < len(line) and line[delimiter_end] == "`":
-            delimiter_end += 1
+        delimiter_end = _backtick_run_end(line, start)
         delimiter_length = delimiter_end - start
-        probe = delimiter_end
-        while probe < len(line):
-            next_delimiter = line.find("`", probe)
-            if next_delimiter == -1:
-                visible.append(line[start:])
-                return "".join(visible)
-            next_end = next_delimiter
-            while next_end < len(line) and line[next_end] == "`":
-                next_end += 1
-            if next_end - next_delimiter == delimiter_length:
-                index = next_end
-                break
-            probe = next_end
-        else:
-            visible.append(line[start:])
-            break
-    return "".join(visible)
+        closing = _find_backtick_run(line, delimiter_end, delimiter_length)
+        if closing is None:
+            return "".join(visible), delimiter_length
+        _, index = closing
+    return "".join(visible), active_length
 
 
-def _links_in_file(path: Path) -> list[tuple[int, str]]:
-    links: list[tuple[int, str]] = []
-    fence: tuple[str, int] | None = None
-    for line_number, line in enumerate(path.read_text(encoding="utf-8").splitlines(), 1):
+def _is_fence_close(line: str, fence: tuple[str, int]) -> bool:
+    match = FENCE_RE.match(line)
+    if match is None:
+        return False
+    marker = match.group(1)
+    return marker[0] == fence[0] and len(marker) >= fence[1] and not match.group(2).strip()
+
+
+def _read_lines(path: Path) -> list[tuple[int, str]]:
+    try:
+        return list(enumerate(path.read_text(encoding="utf-8").splitlines(), 1))
+    except (OSError, UnicodeDecodeError):
+        return []
+
+
+def _include_spec(raw_include: str) -> tuple[str, str | None]:
+    include_path, separator, selector = raw_include.partition(":")
+    return include_path, selector if separator else None
+
+
+def _include_path(candidate: Path, raw_include: str) -> Path:
+    include_path, _ = _include_spec(raw_include)
+    return (candidate.parent / include_path).resolve()
+
+
+def _selected_lines(path: Path, selector: str | None) -> list[tuple[int, str]]:
+    lines = _read_lines(path)
+    if selector is None:
+        return lines
+
+    range_parts = selector.split(":")
+    if len(range_parts) == 2 and all(part == "" or part.isdigit() for part in range_parts):
+        start = max(1, int(range_parts[0])) if range_parts[0] else 1
+        end = int(range_parts[1]) if range_parts[1] else len(lines)
+        return lines[start - 1 : end] if start <= end else []
+    if selector.isdigit():
+        line_number = int(selector)
+        return [lines[line_number - 1]] if 1 <= line_number <= len(lines) else []
+
+    start_index: int | None = None
+    depth = 0
+    for index, (_, line) in enumerate(lines):
+        start_match = ANCHOR_START_RE.match(line)
+        if start_match is not None and start_match.group(1) == selector:
+            if start_index is None:
+                start_index = index
+            depth += 1
+            continue
+        end_match = ANCHOR_END_RE.match(line)
+        if end_match is None or end_match.group(1) != selector or start_index is None:
+            continue
+        depth -= 1
+        if depth == 0:
+            return lines[start_index : index + 1]
+    return []
+
+
+def _is_within(root: Path, path: Path) -> bool:
+    return path == root or root in path.parents
+
+
+ScanLink = tuple[Path, int, str, Path]
+
+
+def _scan_lines(
+    lines: list[tuple[int, str]],
+    source: Path,
+    root: Path,
+    context: Path,
+    stack: tuple[Path, ...],
+    state: tuple[tuple[str, int] | None, int | None] = (None, None),
+) -> tuple[list[ScanLink], tuple[tuple[str, int] | None, int | None]]:
+    links: list[ScanLink] = []
+    fence, inline_code_length = state
+    for line_number, line in lines:
         match = FENCE_RE.match(line)
         if fence is None and match:
             marker = match.group(1)
             fence = (marker[0], len(marker))
             continue
         if fence is not None:
-            if match:
-                marker = match.group(1)
-                if marker[0] == fence[0] and len(marker) >= fence[1]:
-                    fence = None
+            if _is_fence_close(line, fence):
+                fence = None
             continue
-        visible_line = _strip_inline_code(line)
+
+        visible_line, inline_code_length = _strip_inline_code(line, inline_code_length)
         for match in INLINE_LINK_RE.finditer(visible_line):
-            links.append((line_number, match.group(1)))
+            links.append((source, line_number, match.group(1), context))
         reference = REFERENCE_LINK_RE.match(visible_line)
         if reference:
-            links.append((line_number, reference.group(1)))
-    return links
-
-
-def _include_path(candidate: Path, raw_include: str) -> Path:
-    include_path = raw_include.split(":", 1)[0]
-    return (candidate.parent / include_path).resolve()
-
-
-def _include_contexts(root: Path, snippet: Path) -> list[Path]:
-    """Return authored pages whose mdBook include renders ``snippet``."""
-    parents: dict[Path, list[Path]] = {}
-    markdown_files = sorted(root.rglob("*.md")) + sorted(root.rglob("*.mdx"))
-    for candidate in markdown_files:
-        if not candidate.is_file():
-            continue
-        try:
-            content = candidate.read_text(encoding="utf-8")
-        except UnicodeDecodeError:
-            continue
-        for raw_include in INCLUDE_RE.findall(content):
-            included = _include_path(candidate, raw_include)
-            parents.setdefault(included, []).append(candidate)
-
-    contexts: list[Path] = []
-    pending = [snippet.resolve()]
-    visited = set(pending)
-    while pending:
-        included = pending.pop()
-        for candidate in parents.get(included, []):
-            resolved_candidate = candidate.resolve()
-            if resolved_candidate in visited:
+            links.append((source, line_number, reference.group(1), context))
+        for include_match in INCLUDE_RE.finditer(visible_line):
+            raw_include = include_match.group(1)
+            included = _include_path(source, raw_include)
+            if not included.is_file() or not _is_within(root, included) or included in stack:
                 continue
-            visited.add(resolved_candidate)
-            pending.append(resolved_candidate)
-            if "_snippets" not in candidate.parts:
-                contexts.append(candidate)
-    return contexts
+            _, selector = _include_spec(raw_include)
+            child_links, (fence, inline_code_length) = _scan_lines(
+                _selected_lines(included, selector),
+                included,
+                root,
+                context,
+                stack + (included,),
+                (fence, inline_code_length),
+            )
+            links.extend(child_links)
+    return links, (fence, inline_code_length)
 
 
 def find_broken_links(root: Path) -> list[tuple[str, int, str]]:
+    root = root.resolve()
     broken: list[tuple[str, int, str]] = []
     seen: set[tuple[str, int, str]] = set()
     generated_targets = {
@@ -142,22 +209,18 @@ def find_broken_links(root: Path) -> list[tuple[str, int, str]]:
         (root / "reference/config.md").as_posix(),
     }
     for path in sorted(root.rglob("*.md")) + sorted(root.rglob("*.mdx")):
-        if not path.is_file():
+        if not path.is_file() or "_snippets" in path.parts:
             continue
-        source = path.as_posix()
-        source_contexts = _include_contexts(root, path) if "_snippets" in path.parts else [path]
-        if not source_contexts:
-            continue
-        for line_number, raw_target in _links_in_file(path):
-            for context in source_contexts:
-                resolved = _local_target(raw_target, context)
-                if resolved is None or resolved in generated_targets:
-                    continue
-                if not Path(resolved).exists():
-                    entry = (source, line_number, resolved)
-                    if entry not in seen:
-                        seen.add(entry)
-                        broken.append(entry)
+        links, _ = _scan_lines(_read_lines(path), path, root, path, (path,))
+        for source_path, line_number, raw_target, context in links:
+            resolved = _local_target(raw_target, context)
+            if resolved is None or resolved in generated_targets:
+                continue
+            if not Path(resolved).exists():
+                entry = (source_path.as_posix(), line_number, resolved)
+                if entry not in seen:
+                    seen.add(entry)
+                    broken.append(entry)
     return broken
 
 
