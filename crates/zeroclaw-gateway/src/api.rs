@@ -1,7 +1,7 @@
 //! REST API handlers for the web dashboard.
 //! All `/api/*` routes require bearer token authentication (PairingGuard).
 
-use super::{AppState, GW_SESSION_PREFIX, gateway_session_key};
+use super::{AppState, GW_SESSION_PREFIX, gateway_cancel_key, gateway_session_key};
 use axum::{
     extract::{Path, Query, State},
     http::{HeaderMap, StatusCode, header},
@@ -1760,8 +1760,8 @@ pub async fn handle_api_sessions_list(
 /// Resolution prefers **key existence** over punctuation heuristics (WebSocket
 /// clients may pick display ids that contain `_`, e.g. `team_alpha` →
 /// `gw_team_alpha`):
-/// 1. exact `id` if it already exists as a session/cancel key
-/// 2. legacy raw `gw_{id}` if it already exists
+/// 1. exact `id` if it already exists as a session key
+/// 2. raw `gw_{id}` if it already exists
 /// 3. the canonical sanitized gateway key
 /// 4. namespace fallback: keep a `gw_`-prefixed id as-is; otherwise use the
 ///    canonical sanitized gateway key
@@ -1777,6 +1777,24 @@ fn resolve_gateway_session_key(id: &str, exists: impl Fn(&str) -> bool) -> Strin
         return gateway_session_key(id);
     }
     id.to_string()
+}
+
+/// Resolve an API session id to a live process-local cancellation key.
+///
+/// Cancellation registration deliberately keeps the accepted display id raw,
+/// because sanitization would make `team.alpha` and `team_alpha` share a
+/// token. A full persisted key is checked first so callers can pass the
+/// `session_key` returned by `GET /api/sessions`; when the caller passes a
+/// display id, the raw gateway prefix is added exactly once. There is no
+/// sanitized fallback here: guessing from a lossy key could abort a different
+/// live session.
+fn resolve_gateway_cancel_key(id: &str, exists: impl Fn(&str) -> bool) -> Option<String> {
+    if exists(id) {
+        return Some(id.to_string());
+    }
+
+    let display_key = gateway_cancel_key(id);
+    exists(&display_key).then_some(display_key)
 }
 
 /// Display session id used by WebSocket `?session_id=` / event filters.
@@ -1933,17 +1951,24 @@ pub async fn handle_api_session_delete(
 
     let session_key = resolve_gateway_session_key(&id, |key| backend.session_exists(key));
 
-    let token = state
-        .cancel_tokens
-        .lock()
-        .expect("cancel_tokens lock poisoned")
-        .remove(&session_key);
-    if let Some(token) = token {
+    let cancellation = {
+        let mut tokens = state
+            .cancel_tokens
+            .lock()
+            .expect("cancel_tokens lock poisoned");
+        resolve_gateway_cancel_key(&id, |key| tokens.contains_key(key))
+            .and_then(|cancel_key| tokens.remove(&cancel_key).map(|token| (cancel_key, token)))
+    };
+    if let Some((cancel_key, token)) = cancellation {
         token.cancel();
         ::zeroclaw_log::record!(
             INFO,
-            ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
-                .with_attrs(::serde_json::json!({"session_key": session_key})),
+            ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note).with_attrs(
+                ::serde_json::json!({
+                    "session_key": session_key,
+                    "cancel_key": cancel_key,
+                })
+            ),
             "cancelled in-flight turn for deleted session"
         );
     }
@@ -2103,24 +2128,26 @@ pub async fn handle_api_session_abort(
         return e.into_response();
     }
 
-    // Resolve + look up under one lock so underscore-bearing display ids
-    // (e.g. `team_alpha`) match the live `gw_{id}` cancel-token key.
-    let (session_key, token) = {
+    // Resolve + look up under one lock so display ids and full session keys
+    // both address the raw, collision-safe cancellation key.
+    let (cancel_key, token) = {
         let tokens = state
             .cancel_tokens
             .lock()
             .expect("cancel_tokens lock poisoned");
-        let session_key = resolve_gateway_session_key(&id, |key| tokens.contains_key(key));
-        let token = tokens.get(&session_key).cloned();
-        (session_key, token)
+        let cancel_key = resolve_gateway_cancel_key(&id, |key| tokens.contains_key(key));
+        let token = cancel_key
+            .as_deref()
+            .and_then(|key| tokens.get(key).cloned());
+        (cancel_key, token)
     };
 
-    if let Some(token) = token {
+    if let (Some(cancel_key), Some(token)) = (cancel_key, token) {
         token.cancel();
         ::zeroclaw_log::record!(
             INFO,
             ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
-                .with_attrs(::serde_json::json!({"session_key": session_key})),
+                .with_attrs(::serde_json::json!({"cancel_key": cancel_key})),
             "session abort requested"
         );
         Json(serde_json::json!({ "status": "aborted" })).into_response()
@@ -3623,6 +3650,31 @@ pub(crate) mod tests {
     }
 
     #[test]
+    fn resolve_gateway_cancel_key_accepts_display_and_full_ids_without_collisions() {
+        let dotted = |key: &str| key == "gw_team.alpha";
+        assert_eq!(
+            resolve_gateway_cancel_key("team.alpha", dotted),
+            Some("gw_team.alpha".to_string())
+        );
+        assert_eq!(
+            resolve_gateway_cancel_key("gw_team.alpha", dotted),
+            Some("gw_team.alpha".to_string())
+        );
+
+        let both = |key: &str| key == "gw_team.alpha" || key == "gw_team_alpha";
+        assert_eq!(
+            resolve_gateway_cancel_key("team.alpha", both),
+            Some("gw_team.alpha".to_string()),
+            "dotted display ids must retain their raw cancellation identity"
+        );
+        assert_eq!(
+            resolve_gateway_cancel_key("team_alpha", both),
+            Some("gw_team_alpha".to_string()),
+            "underscored display ids must not collide with dotted ids"
+        );
+    }
+
+    #[test]
     fn gateway_display_session_id_strips_gw_prefix() {
         assert_eq!(gateway_display_session_id("gw_operator-1"), "operator-1");
         assert_eq!(gateway_display_session_id("gw_team_alpha"), "team_alpha");
@@ -3861,6 +3913,50 @@ pub(crate) mod tests {
             !backend.session_exists("gw_team.alpha"),
             "deletion must target the persisted dotted session key"
         );
+    }
+
+    #[tokio::test]
+    async fn session_delete_cancels_raw_dotted_turn_for_sanitized_persistence_key() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let config = zeroclaw_config::schema::Config {
+            data_dir: tmp.path().join("workspace"),
+            config_path: tmp.path().join("config.toml"),
+            ..zeroclaw_config::schema::Config::default()
+        };
+        std::fs::create_dir_all(&config.data_dir).unwrap();
+        let backend: Arc<dyn SessionBackend> =
+            Arc::new(SqliteSessionBackend::new(tmp.path()).unwrap());
+        // This is the persistence identity used by the streamed webhook
+        // path. The live cancellation identity must remain the raw dotted
+        // display id, so deletion has to resolve the two independently.
+        backend
+            .append(
+                "gw_team_alpha",
+                &zeroclaw_providers::ChatMessage::assistant("existing"),
+            )
+            .unwrap();
+        let state = test_state_with_session_backend(config, backend.clone());
+        let token = tokio_util::sync::CancellationToken::new();
+        state
+            .cancel_tokens
+            .lock()
+            .expect("cancel_tokens lock")
+            .insert("gw_team.alpha".to_string(), Arc::new(token.clone()));
+
+        let response = handle_api_session_delete(
+            State(state),
+            HeaderMap::new(),
+            Path("team.alpha".to_string()),
+        )
+        .await
+        .into_response();
+
+        assert_eq!(response.status(), StatusCode::OK);
+        assert!(
+            token.is_cancelled(),
+            "deletion must cancel the raw dotted turn even when persistence is sanitized"
+        );
+        assert!(!backend.session_exists("gw_team_alpha"));
     }
 
     #[tokio::test]
