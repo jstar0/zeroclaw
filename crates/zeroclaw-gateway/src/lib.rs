@@ -3244,6 +3244,10 @@ fn sse_error_frame(message: &str) -> Result<SseWireEvent, std::convert::Infallib
     Ok(SseWireEvent::default().event("error").data(data))
 }
 
+fn try_send_sse_error_frame(frame_tx: &tokio::sync::mpsc::Sender<SseFrame>, message: &str) {
+    let _ = frame_tx.try_send(sse_error_frame(message));
+}
+
 /// Reconcile the runtime's authoritative final response with text already
 /// emitted from streamed chunks. The runtime may return a cached response with
 /// no chunks, or append a receipt/fallback suffix after the last chunk. Prefix
@@ -3458,7 +3462,7 @@ async fn run_gateway_chat_streaming_response(
                             "turn-interrupted-by-user",
                         ),
                     );
-                    let _ = frame_tx.try_send(sse_error_frame(&message));
+                    try_send_sse_error_frame(&frame_tx, &message);
                     remove_cancel_token_if_current(
                         &state_for_frames.cancel_tokens,
                         &cancel_key_for_frames,
@@ -3498,10 +3502,22 @@ async fn run_gateway_chat_streaming_response(
                 .await;
             }
             Err(e) => {
-                let sanitized = zeroclaw_providers::sanitize_api_error(&e.to_string());
-                let _ =
-                    send_sse_frame_or_cancel(&frame_tx, sse_error_frame(&sanitized), &cancel_token)
-                        .await;
+                if cancel_token.is_cancelled() {
+                    let message = zeroclaw_providers::sanitize_api_error(
+                        &zeroclaw_runtime::i18n::get_required_cli_string(
+                            "turn-interrupted-by-user",
+                        ),
+                    );
+                    try_send_sse_error_frame(&frame_tx, &message);
+                } else {
+                    let sanitized = zeroclaw_providers::sanitize_api_error(&e.to_string());
+                    let _ = send_sse_frame_or_cancel(
+                        &frame_tx,
+                        sse_error_frame(&sanitized),
+                        &cancel_token,
+                    )
+                    .await;
+                }
             }
         }
     });
