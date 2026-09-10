@@ -3267,6 +3267,17 @@ fn reconcile_sse_final_response(cumulative: &mut String, final_response: &str) -
 
 type SseFrame = Result<SseWireEvent, std::convert::Infallible>;
 
+async fn send_sse_frame_or_cancel(
+    frame_tx: &tokio::sync::mpsc::Sender<SseFrame>,
+    frame: SseFrame,
+    cancel_token: &tokio_util::sync::CancellationToken,
+) -> bool {
+    tokio::select! {
+        result = frame_tx.send(frame) => result.is_ok(),
+        _ = cancel_token.cancelled() => false,
+    }
+}
+
 /// Register the current turn for a gateway session and cancel any replaced
 /// turn before returning. Both HTTP/SSE and WebSocket transports share this
 /// registry, so replacement ownership must be identical at both edges.
@@ -3417,7 +3428,13 @@ async fn run_gateway_chat_streaming_response(
                 maybe = event_rx.recv() => match maybe {
                     Some(zeroclaw_api::agent::TurnEvent::Chunk { delta }) => {
                         cumulative.push_str(&delta);
-                        if frame_tx.send(sse_token_frame(&cumulative)).await.is_err() {
+                        if !send_sse_frame_or_cancel(
+                            &frame_tx,
+                            sse_token_frame(&cumulative),
+                            &cancel_token,
+                        )
+                        .await
+                        {
                             // Client went away: cancel the in-flight turn.
                             cancel_token.cancel();
                             remove_cancel_token_if_current(
@@ -3441,7 +3458,7 @@ async fn run_gateway_chat_streaming_response(
                             "turn-interrupted-by-user",
                         ),
                     );
-                    let _ = frame_tx.send(sse_error_frame(&message)).await;
+                    let _ = frame_tx.try_send(sse_error_frame(&message));
                     remove_cancel_token_if_current(
                         &state_for_frames.cancel_tokens,
                         &cancel_key_for_frames,
@@ -3468,17 +3485,23 @@ async fn run_gateway_chat_streaming_response(
             Ok(final_response) => {
                 if let Some(frame) = reconcile_sse_final_response(&mut cumulative, &final_response)
                 {
-                    if frame_tx.send(frame).await.is_err() {
+                    if !send_sse_frame_or_cancel(&frame_tx, frame, &cancel_token).await {
+                        cancel_token.cancel();
                         return;
                     }
                 }
-                let _ = frame_tx
-                    .send(Ok(SseWireEvent::default().event("done").data("{}")))
-                    .await;
+                let _ = send_sse_frame_or_cancel(
+                    &frame_tx,
+                    Ok(SseWireEvent::default().event("done").data("{}")),
+                    &cancel_token,
+                )
+                .await;
             }
             Err(e) => {
                 let sanitized = zeroclaw_providers::sanitize_api_error(&e.to_string());
-                let _ = frame_tx.send(sse_error_frame(&sanitized)).await;
+                let _ =
+                    send_sse_frame_or_cancel(&frame_tx, sse_error_frame(&sanitized), &cancel_token)
+                        .await;
             }
         }
     });
@@ -4575,7 +4598,7 @@ mod tests {
     use axum::response::IntoResponse;
     use http_body_util::BodyExt;
     use parking_lot::{Mutex, RwLock};
-    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
     use tower::ServiceExt;
     #[cfg(feature = "channel-whatsapp-cloud")]
     use zeroclaw_api::channel::ChannelMessage;
@@ -6674,6 +6697,8 @@ path = "{trigger_path}"
     struct ChatCompletionFixture {
         address: SocketAddr,
         requests: Arc<AtomicUsize>,
+        stream_chunks: Arc<AtomicUsize>,
+        stream_closed: Arc<AtomicBool>,
         server: tokio::task::JoinHandle<()>,
     }
 
@@ -6736,6 +6761,104 @@ path = "{trigger_path}"
         ChatCompletionFixture {
             address,
             requests,
+            stream_chunks: Arc::new(AtomicUsize::new(0)),
+            stream_closed: Arc::new(AtomicBool::new(false)),
+            server,
+        }
+    }
+
+    struct BurstChatStream {
+        bodies: Arc<Vec<String>>,
+        next: usize,
+        emitted: Arc<AtomicUsize>,
+        closed: Arc<AtomicBool>,
+    }
+
+    impl futures_util::Stream for BurstChatStream {
+        type Item = Result<String, std::convert::Infallible>;
+
+        fn poll_next(
+            mut self: std::pin::Pin<&mut Self>,
+            _cx: &mut std::task::Context<'_>,
+        ) -> std::task::Poll<Option<Self::Item>> {
+            if let Some(body) = self.bodies.get(self.next).cloned() {
+                self.next += 1;
+                self.emitted.fetch_add(1, Ordering::SeqCst);
+                std::task::Poll::Ready(Some(Ok(body)))
+            } else {
+                std::task::Poll::Pending
+            }
+        }
+    }
+
+    impl Drop for BurstChatStream {
+        fn drop(&mut self) {
+            self.closed.store(true, Ordering::SeqCst);
+        }
+    }
+
+    async fn spawn_burst_hanging_chat_completion_fixture() -> ChatCompletionFixture {
+        let requests = Arc::new(AtomicUsize::new(0));
+        let stream_chunks = Arc::new(AtomicUsize::new(0));
+        let stream_closed = Arc::new(AtomicBool::new(false));
+        let requests_for_handler = Arc::clone(&requests);
+        let bodies: Arc<Vec<String>> = Arc::new(
+            (0..17)
+                .map(|index| {
+                    format!(
+                        "data: {{\"choices\":[{{\"delta\":{{\"content\":\"chunk-{index}\"}}}}]}}\n\n"
+                    )
+                })
+                .collect(),
+        );
+        let bodies_for_handler = Arc::clone(&bodies);
+        let chunks_for_handler = Arc::clone(&stream_chunks);
+        let closed_for_handler = Arc::clone(&stream_closed);
+        let app = Router::new().route(
+            "/v1/chat/completions",
+            post(
+                move |_: HeaderMap,
+                      axum::extract::Json(_request): axum::extract::Json<serde_json::Value>| {
+                    let requests = Arc::clone(&requests_for_handler);
+                    let bodies = Arc::clone(&bodies_for_handler);
+                    let emitted = Arc::clone(&chunks_for_handler);
+                    let closed = Arc::clone(&closed_for_handler);
+                    async move {
+                        requests.fetch_add(1, Ordering::SeqCst);
+                        let stream = BurstChatStream {
+                            bodies,
+                            next: 0,
+                            emitted,
+                            closed,
+                        };
+                        (
+                            [(
+                                header::CONTENT_TYPE,
+                                HeaderValue::from_static("text/event-stream"),
+                            )],
+                            Body::from_stream(stream),
+                        )
+                            .into_response()
+                    }
+                },
+            ),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind burst chat-completions fixture");
+        let address = listener
+            .local_addr()
+            .expect("burst chat-completions fixture address");
+        let server = zeroclaw_spawn::spawn!(async move {
+            axum::serve(listener, app)
+                .await
+                .expect("serve burst chat-completions fixture");
+        });
+        ChatCompletionFixture {
+            address,
+            requests,
+            stream_chunks,
+            stream_closed,
             server,
         }
     }
@@ -6784,6 +6907,8 @@ path = "{trigger_path}"
         ChatCompletionFixture {
             address,
             requests,
+            stream_chunks: Arc::new(AtomicUsize::new(0)),
+            stream_closed: Arc::new(AtomicBool::new(false)),
             server,
         }
     }
@@ -6817,6 +6942,19 @@ path = "{trigger_path}"
         })
         .await
         .expect("provider fixture request");
+    }
+
+    async fn wait_for_fixture_chunks(fixture: &ChatCompletionFixture, expected: usize) {
+        tokio::time::timeout(Duration::from_secs(3), async {
+            loop {
+                if fixture.stream_chunks.load(Ordering::SeqCst) >= expected {
+                    return;
+                }
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .expect("provider fixture stream chunks");
     }
 
     async fn wait_for_registry_token(
@@ -7415,6 +7553,43 @@ data: [DONE]\n\n";
             text.contains("event: error"),
             "server-side cancellation must terminate an open SSE stream with an error frame: {text}"
         );
+    }
+
+    #[tokio::test]
+    async fn webhook_sse_abort_cancels_backpressured_unread_client() {
+        let fixture = spawn_burst_hanging_chat_completion_fixture().await;
+        let tmp = tempfile::tempdir().expect("backpressure temp dir");
+        let (state, _) = production_sse_state(&tmp, &fixture.base_url(), 1.0, false);
+        let session_id = "sse-backpressure";
+        let response = start_test_sse(&state, session_id).await;
+        assert_eq!(response.status(), StatusCode::OK);
+
+        let cancel_key = gateway_cancel_key(session_id);
+        let token = wait_for_registry_token(&state, &cancel_key).await;
+        wait_for_fixture_requests(&fixture, 1).await;
+        wait_for_fixture_chunks(&fixture, 17).await;
+
+        token.cancel();
+        tokio::time::timeout(Duration::from_secs(3), async {
+            loop {
+                let registry_empty = !state
+                    .cancel_tokens
+                    .lock()
+                    .expect("cancel_tokens lock poisoned")
+                    .contains_key(&cancel_key);
+                let provider_closed = fixture.stream_closed.load(Ordering::SeqCst);
+                if registry_empty && provider_closed {
+                    return;
+                }
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .expect("server-side abort must wake a backpressured SSE turn");
+
+        assert!(token.is_cancelled());
+        assert!(fixture.stream_closed.load(Ordering::SeqCst));
+        drop(response);
     }
 
     #[tokio::test]
