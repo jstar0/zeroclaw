@@ -1485,11 +1485,12 @@ mod tests {
         let missing_binary = artifact_dir
             .path()
             .join(format!("missing-edge-tts-{}", uuid::Uuid::new_v4()));
-        let provider = EdgeTtsProvider::new_with_binary(
+        let provider = EdgeTtsProvider::new_with_command(
             "test",
             missing_binary
                 .to_str()
                 .expect("missing binary path must be valid UTF-8"),
+            &[],
             std::time::Duration::from_secs(5),
         )
         .with_artifact_dir(artifact_dir.path().to_path_buf());
