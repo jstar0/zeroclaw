@@ -736,14 +736,36 @@ impl EdgeTtsProvider {
     fn create_owner_only_artifact(path: &std::path::Path) -> Result<()> {
         #[cfg(unix)]
         {
-            use std::os::unix::fs::OpenOptionsExt;
+            use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
 
-            std::fs::OpenOptions::new()
+            let artifact = std::fs::OpenOptions::new()
                 .write(true)
                 .create_new(true)
                 .mode(0o600)
                 .open(path)
                 .context("Failed to create Edge TTS artifact with owner-only permissions")?;
+
+            // `open(2)` applies the process umask to the requested mode. Apply
+            // the final mode through the open handle so a restrictive umask
+            // cannot make the file unusable, and so a path replacement between
+            // creation and permission hardening cannot redirect the chmod.
+            let permission_result = artifact
+                .set_permissions(std::fs::Permissions::from_mode(0o600))
+                .context("Failed to apply owner-only permissions to Edge TTS artifact");
+            drop(artifact);
+
+            if let Err(error) = permission_result {
+                // The file was created by this call, so retain ownership of
+                // cleanup when permission hardening fails. Do not mask the
+                // primary permission error if the best-effort unlink also
+                // fails.
+                if let Err(cleanup_error) = std::fs::remove_file(path) {
+                    return Err(error.context(format!(
+                        "Failed to remove Edge TTS artifact after permission setup failed: {cleanup_error}"
+                    )));
+                }
+                return Err(error);
+            }
         }
         #[cfg(not(unix))]
         {
@@ -1372,6 +1394,88 @@ mod tests {
         assert!(EdgeTtsProvider::create_owner_only_artifact(&path).is_err());
 
         let _ = std::fs::remove_file(&path);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn edge_tts_artifact_is_owner_only_and_writable_under_restrictive_umask() {
+        const CHILD_ENV: &str = "ZEROCLAW_TTS_UMASK_TEST_CHILD";
+        const TEST_NAME: &str =
+            "tts::tests::edge_tts_artifact_is_owner_only_and_writable_under_restrictive_umask";
+
+        // The umask is process-global. Run the behavioral part in a dedicated
+        // test subprocess so unrelated tests in the parent harness cannot
+        // observe the temporary restrictive umask.
+        if std::env::var_os(CHILD_ENV).is_none() {
+            let status = std::process::Command::new(
+                std::env::current_exe().expect("test executable must be available"),
+            )
+            .args(["--exact", TEST_NAME, "--nocapture"])
+            .env(CHILD_ENV, "1")
+            .status()
+            .expect("spawn restrictive-umask test subprocess");
+            assert!(
+                status.success(),
+                "restrictive-umask test subprocess failed with status {status}"
+            );
+            return;
+        }
+
+        struct UmaskRestore(libc::mode_t);
+
+        impl Drop for UmaskRestore {
+            fn drop(&mut self) {
+                // SAFETY: umask only changes this test subprocess's process
+                // state, and the original value was captured immediately
+                // before the test changed it.
+                unsafe {
+                    libc::umask(self.0);
+                }
+            }
+        }
+
+        // Create the directory before tightening the umask; otherwise the
+        // test fixture itself would be created with mode 000 and be unusable.
+        let artifact_dir = tempfile::tempdir().expect("create isolated artifact directory");
+
+        // SAFETY: umask accepts any mode bits and returns the prior process
+        // value; this subprocess runs only the current test.
+        let previous_umask = unsafe { libc::umask(0o777) };
+        let _umask_restore = UmaskRestore(previous_umask);
+
+        let artifact_path = artifact_dir.path().join("artifact.mp3");
+        let artifact_path = artifact_path
+            .to_str()
+            .expect("artifact path must be valid UTF-8");
+        EdgeTtsProvider::create_owner_only_artifact(std::path::Path::new(artifact_path))
+            .expect("artifact creation must survive a restrictive umask");
+
+        use std::os::unix::fs::PermissionsExt;
+        let mode = std::fs::metadata(artifact_path)
+            .expect("inspect artifact")
+            .permissions()
+            .mode();
+        assert_eq!(
+            mode & 0o777,
+            0o600,
+            "the artifact must be exactly owner-only before the child writes it"
+        );
+
+        let status = std::process::Command::new("sh")
+            .args([
+                "-c",
+                "printf audio > \"$1\"",
+                "edge-tts-umask-test",
+                artifact_path,
+            ])
+            .status()
+            .expect("spawn child writer");
+        assert!(status.success(), "child writer failed with status {status}");
+        assert_eq!(
+            std::fs::read(artifact_path).expect("read child-written artifact"),
+            b"audio"
+        );
+        std::fs::remove_file(artifact_path).expect("remove test artifact");
     }
 
     #[cfg(unix)]
