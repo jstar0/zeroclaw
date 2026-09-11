@@ -81,6 +81,7 @@ use axum::{
 };
 use parking_lot::{Mutex, RwLock};
 use std::collections::HashMap;
+use std::future::Future;
 use std::net::{IpAddr, SocketAddr};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -3244,8 +3245,13 @@ fn sse_error_frame(message: &str) -> Result<SseWireEvent, std::convert::Infallib
     Ok(SseWireEvent::default().event("error").data(data))
 }
 
-fn try_send_sse_error_frame(frame_tx: &tokio::sync::mpsc::Sender<SseFrame>, message: &str) {
-    let _ = frame_tx.try_send(sse_error_frame(message));
+fn send_sse_terminal_error(
+    terminal_tx: &mut Option<tokio::sync::oneshot::Sender<SseFrame>>,
+    message: &str,
+) {
+    if let Some(sender) = terminal_tx.take() {
+        let _ = sender.send(sse_error_frame(message));
+    }
 }
 
 /// Reconcile the runtime's authoritative final response with text already
@@ -3326,6 +3332,8 @@ pub(crate) fn remove_cancel_token_if_current(
 
 struct SseClientStream {
     receiver: tokio::sync::mpsc::Receiver<SseFrame>,
+    terminal_receiver: Option<tokio::sync::oneshot::Receiver<SseFrame>>,
+    terminal_delivered: bool,
     cancel_token: Arc<tokio_util::sync::CancellationToken>,
     cancel_tokens: Arc<
         std::sync::Mutex<
@@ -3342,7 +3350,34 @@ impl futures_util::Stream for SseClientStream {
         self: std::pin::Pin<&mut Self>,
         cx: &mut std::task::Context<'_>,
     ) -> std::task::Poll<Option<Self::Item>> {
-        self.get_mut().receiver.poll_recv(cx)
+        let this = self.get_mut();
+        if this.terminal_delivered {
+            return std::task::Poll::Ready(None);
+        }
+
+        if let Some(terminal_receiver) = this.terminal_receiver.as_mut() {
+            match std::pin::Pin::new(terminal_receiver).poll(cx) {
+                std::task::Poll::Ready(Ok(frame)) => {
+                    // A terminal error is deliberately independent of the
+                    // bounded token queue. Once it is delivered, discard any
+                    // queued token frames so the client observes one terminal
+                    // error rather than a truncated stream followed by stale
+                    // data.
+                    this.terminal_receiver = None;
+                    this.terminal_delivered = true;
+                    this.receiver.close();
+                    return std::task::Poll::Ready(Some(frame));
+                }
+                std::task::Poll::Ready(Err(_)) => {
+                    // Normal completion drops the sender after enqueueing the
+                    // regular done frame. Continue draining that frame queue.
+                    this.terminal_receiver = None;
+                }
+                std::task::Poll::Pending => {}
+            }
+        }
+
+        this.receiver.poll_recv(cx)
     }
 }
 
@@ -3400,6 +3435,7 @@ async fn run_gateway_chat_streaming_response(
     register_cancel_token(&state.cancel_tokens, &cancel_key, Arc::clone(&cancel_token));
 
     let (frame_tx, frame_rx) = tokio::sync::mpsc::channel::<SseFrame>(16);
+    let (terminal_tx, terminal_rx) = tokio::sync::oneshot::channel::<SseFrame>();
     let (turn_tx, turn_rx) = tokio::sync::oneshot::channel::<anyhow::Result<String>>();
 
     let state_for_turn = state.clone();
@@ -3426,6 +3462,7 @@ async fn run_gateway_chat_streaming_response(
     let cancel_key_for_frames = cancel_key.clone();
     let token_for_stream = Arc::clone(&cancel_token);
     zeroclaw_spawn::spawn!(async move {
+        let mut terminal_tx = Some(terminal_tx);
         let mut cumulative = String::new();
         loop {
             tokio::select! {
@@ -3439,8 +3476,16 @@ async fn run_gateway_chat_streaming_response(
                         )
                         .await
                         {
-                            // Client went away: cancel the in-flight turn.
+                            // The bounded token queue may be full, so a
+                            // cancellation-aware send can return without
+                            // delivering the terminal frame through it.
                             cancel_token.cancel();
+                            let message = zeroclaw_providers::sanitize_api_error(
+                                &zeroclaw_runtime::i18n::get_required_cli_string(
+                                    "turn-interrupted-by-user",
+                                ),
+                            );
+                            send_sse_terminal_error(&mut terminal_tx, &message);
                             remove_cancel_token_if_current(
                                 &state_for_frames.cancel_tokens,
                                 &cancel_key_for_frames,
@@ -3462,7 +3507,7 @@ async fn run_gateway_chat_streaming_response(
                             "turn-interrupted-by-user",
                         ),
                     );
-                    try_send_sse_error_frame(&frame_tx, &message);
+                    send_sse_terminal_error(&mut terminal_tx, &message);
                     remove_cancel_token_if_current(
                         &state_for_frames.cancel_tokens,
                         &cancel_key_for_frames,
@@ -3491,15 +3536,30 @@ async fn run_gateway_chat_streaming_response(
                 {
                     if !send_sse_frame_or_cancel(&frame_tx, frame, &cancel_token).await {
                         cancel_token.cancel();
+                        let message = zeroclaw_providers::sanitize_api_error(
+                            &zeroclaw_runtime::i18n::get_required_cli_string(
+                                "turn-interrupted-by-user",
+                            ),
+                        );
+                        send_sse_terminal_error(&mut terminal_tx, &message);
                         return;
                     }
                 }
-                let _ = send_sse_frame_or_cancel(
+                if !send_sse_frame_or_cancel(
                     &frame_tx,
                     Ok(SseWireEvent::default().event("done").data("{}")),
                     &cancel_token,
                 )
-                .await;
+                .await
+                {
+                    cancel_token.cancel();
+                    let message = zeroclaw_providers::sanitize_api_error(
+                        &zeroclaw_runtime::i18n::get_required_cli_string(
+                            "turn-interrupted-by-user",
+                        ),
+                    );
+                    send_sse_terminal_error(&mut terminal_tx, &message);
+                }
             }
             Err(e) => {
                 if cancel_token.is_cancelled() {
@@ -3508,15 +3568,24 @@ async fn run_gateway_chat_streaming_response(
                             "turn-interrupted-by-user",
                         ),
                     );
-                    try_send_sse_error_frame(&frame_tx, &message);
+                    send_sse_terminal_error(&mut terminal_tx, &message);
                 } else {
                     let sanitized = zeroclaw_providers::sanitize_api_error(&e.to_string());
-                    let _ = send_sse_frame_or_cancel(
+                    if !send_sse_frame_or_cancel(
                         &frame_tx,
                         sse_error_frame(&sanitized),
                         &cancel_token,
                     )
-                    .await;
+                    .await
+                    {
+                        cancel_token.cancel();
+                        let message = zeroclaw_providers::sanitize_api_error(
+                            &zeroclaw_runtime::i18n::get_required_cli_string(
+                                "turn-interrupted-by-user",
+                            ),
+                        );
+                        send_sse_terminal_error(&mut terminal_tx, &message);
+                    }
                 }
             }
         }
@@ -3524,6 +3593,8 @@ async fn run_gateway_chat_streaming_response(
 
     let body = SseBody::new(SseClientStream {
         receiver: frame_rx,
+        terminal_receiver: Some(terminal_rx),
+        terminal_delivered: false,
         cancel_token: token_for_stream,
         cancel_tokens: Arc::clone(&state.cancel_tokens),
         cancel_key,
@@ -7605,7 +7676,19 @@ data: [DONE]\n\n";
 
         assert!(token.is_cancelled());
         assert!(fixture.stream_closed.load(Ordering::SeqCst));
-        drop(response);
+
+        // The response body was intentionally left unread while the bounded
+        // token queue filled. Resuming the read must still deliver the
+        // cancellation terminal frame through its priority channel.
+        let text = collect_cancelled_sse(response).await;
+        assert!(
+            text.contains("event: error"),
+            "backpressured cancellation must retain its terminal error: {text}"
+        );
+        assert!(
+            !text.contains("event: done"),
+            "a cancelled backpressured stream must not complete: {text}"
+        );
     }
 
     #[tokio::test]
