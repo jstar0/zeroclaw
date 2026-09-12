@@ -173,6 +173,93 @@ class InternalDocsLinksTest(unittest.TestCase):
         self.assertNotIn("trailing-fence-placeholder.md", result.stdout)
         self.assertNotIn("nested-fenced-placeholder.md", result.stdout)
 
+    def test_unmatched_or_escaped_backticks_do_not_hide_real_links(self) -> None:
+        cases = (
+            (
+                "unmatched backtick in the same paragraph",
+                "A literal ` character. [Missing](same-paragraph.md)\n",
+                "same-paragraph.md",
+            ),
+            (
+                "escaped backtick",
+                "A literal \\` character. [Missing](escaped-backtick.md)\n",
+                "escaped-backtick.md",
+            ),
+            (
+                "backticks in separate paragraphs",
+                "A literal ` character.\n\n"
+                "[Missing](between-paragraphs.md)\n\n"
+                "Another literal ` character.\n",
+                "between-paragraphs.md",
+            ),
+            (
+                "fenced block between an unmatched backtick and a link",
+                "A literal ` character.\n"
+                "```md\n[Example](fenced-example.md)\n```\n"
+                "[Missing](after-fence.md)\n",
+                "after-fence.md",
+            ),
+            (
+                "blockquote after an unmatched backtick",
+                "A literal ` character.\n> [Missing](after-blockquote.md)\n",
+                "after-blockquote.md",
+            ),
+            (
+                "heading after an unmatched backtick",
+                "A literal ` character.\n# Heading\n[Missing](after-heading.md)\n",
+                "after-heading.md",
+            ),
+            (
+                "list after an unmatched backtick",
+                "A literal ` character.\n- [Missing](after-list.md)\n",
+                "after-list.md",
+            ),
+        )
+
+        for name, content, expected_target in cases:
+            with self.subTest(name=name):
+                result = self.run_checker({"index.md": content})
+
+                self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
+                self.assertIn(expected_target, result.stdout)
+
+    def test_preserves_multiline_inline_code_in_blockquotes(self) -> None:
+        result = self.run_checker(
+            {
+                "index.md": (
+                    "> `[Example](quoted-placeholder.md)\n"
+                    "> continues`\n"
+                    "> [Missing](missing-after-quote.md)\n"
+                ),
+            }
+        )
+
+        self.assertEqual(result.returncode, 1)
+        self.assertIn("missing-after-quote.md", result.stdout)
+        self.assertNotIn("quoted-placeholder.md", result.stdout)
+
+    def test_preserves_multiline_inline_code_in_list_items(self) -> None:
+        result = self.run_checker(
+            {
+                "index.md": (
+                    "- `[Example](list-placeholder.md)\n"
+                    "  continues`\n"
+                    "- [Missing](missing-after-list-item.md)\n"
+                ),
+            }
+        )
+
+        self.assertEqual(result.returncode, 1)
+        self.assertIn("missing-after-list-item.md", result.stdout)
+        self.assertNotIn("list-placeholder.md", result.stdout)
+
+    def test_even_backslash_run_does_not_escape_code_span_delimiter(self) -> None:
+        result = self.run_checker(
+            {"index.md": "A literal \\\\`[Example](inline-placeholder.md)`\n"}
+        )
+
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+
 
 if __name__ == "__main__":
     unittest.main()

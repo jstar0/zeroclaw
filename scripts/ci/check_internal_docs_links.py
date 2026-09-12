@@ -14,6 +14,19 @@ from pathlib import Path
 INLINE_LINK_RE = re.compile(r"!?\[[^\]]*\]\(([^)]+)\)")
 REFERENCE_LINK_RE = re.compile(r"^\s*\[[^\]]+\]:\s*(\S+)")
 FENCE_RE = re.compile(r"^[ \t]*(`{3,}|~{3,})(.*)$")
+QUOTE_PREFIX_RE = re.compile(r"^[ \t]{0,3}>[ \t]?(?:>[ \t]?)*")
+ATX_HEADING_RE = re.compile(r"^[ \t]{0,3}#{1,6}(?:[ \t]+|$)")
+THEMATIC_BREAK_RE = re.compile(r"^[ \t]{0,3}(?:={3,}|-{3,}|(?:\*[ \t]*){3,}|(?:_[ \t]*){3,})[ \t]*$")
+BLOCK_START_RE = re.compile(
+    r"^[ \t]{0,3}(?:"
+    r"#{1,6}(?:[ \t]+|$)|"
+    r">[ \t]?|"
+    r"(?:[-+*]|\d{1,9}[.)])[ \t]+|"
+    r"(?:={3,}|-{3,})[ \t]*$|"
+    r"(?:\*[ \t]*){3,}$|"
+    r"(?:_[ \t]*){3,}$"
+    r")"
+)
 INCLUDE_RE = re.compile(r"\{\{#include\s+([^}\s]+)")
 ANCHOR_START_RE = re.compile(r"^[ \t]*<!--\s*ANCHOR:\s*([^\s]+)\s*-->[ \t]*$")
 ANCHOR_END_RE = re.compile(r"^[ \t]*<!--\s*ANCHOR_END:\s*([^\s]+)\s*-->[ \t]*$")
@@ -64,7 +77,55 @@ def _find_backtick_run(line: str, start: int, length: int) -> tuple[int, int] | 
     return None
 
 
-def _strip_inline_code(line: str, inline_code_length: int | None) -> tuple[str, int | None]:
+def _is_escaped_backtick(line: str, start: int) -> bool:
+    backslashes = 0
+    probe = start - 1
+    while probe >= 0 and line[probe] == "\\":
+        backslashes += 1
+        probe -= 1
+    return backslashes % 2 == 1
+
+
+def _blockquote_content(line: str) -> tuple[int, str]:
+    match = QUOTE_PREFIX_RE.match(line)
+    if match is None:
+        return 0, line
+    prefix = match.group()
+    return prefix.count(">"), line[match.end() :]
+
+
+def _has_matching_backtick(
+    lines: list[tuple[int, str]], line_index: int, start: int, length: int
+) -> bool:
+    start_quote_depth, start_content = _blockquote_content(lines[line_index][1])
+    if _find_backtick_run(lines[line_index][1], start, length) is not None:
+        return True
+    if ATX_HEADING_RE.match(start_content) or THEMATIC_BREAK_RE.match(start_content):
+        return False
+
+    for candidate_index in range(line_index, len(lines)):
+        candidate = lines[candidate_index][1]
+        if candidate_index == line_index:
+            continue
+        if not candidate.strip() or FENCE_RE.match(candidate):
+            return False
+        quote_depth, content = _blockquote_content(candidate)
+        if quote_depth and quote_depth != start_quote_depth:
+            return False
+        if not content.strip() or BLOCK_START_RE.match(content) or FENCE_RE.match(content):
+            return False
+        search_start = 0
+        if _find_backtick_run(candidate, search_start, length) is not None:
+            return True
+    return False
+
+
+def _strip_inline_code(
+    line: str,
+    inline_code_length: int | None,
+    lines: list[tuple[int, str]],
+    line_index: int,
+) -> tuple[str, int | None]:
     visible: list[str] = []
     index = 0
     active_length = inline_code_length
@@ -84,6 +145,14 @@ def _strip_inline_code(line: str, inline_code_length: int | None) -> tuple[str, 
         visible.append(line[index:start])
         delimiter_end = _backtick_run_end(line, start)
         delimiter_length = delimiter_end - start
+        if _is_escaped_backtick(line, start):
+            visible.append(line[start : start + 1])
+            index = start + 1
+            continue
+        if not _has_matching_backtick(lines, line_index, delimiter_end, delimiter_length):
+            visible.append(line[start:delimiter_end])
+            index = delimiter_end
+            continue
         closing = _find_backtick_run(line, delimiter_end, delimiter_length)
         if closing is None:
             return "".join(visible), delimiter_length
@@ -165,18 +234,28 @@ def _scan_lines(
 ) -> tuple[list[ScanLink], tuple[tuple[str, int] | None, int | None]]:
     links: list[ScanLink] = []
     fence, inline_code_length = state
-    for line_number, line in lines:
+    for line_index, (line_number, line) in enumerate(lines):
         match = FENCE_RE.match(line)
         if fence is None and match:
             marker = match.group(1)
             fence = (marker[0], len(marker))
+            inline_code_length = None
             continue
         if fence is not None:
             if _is_fence_close(line, fence):
                 fence = None
+                inline_code_length = None
             continue
+        quote_depth, content = _blockquote_content(line)
+        if not line.strip() or (quote_depth > 0 and not content.strip()):
+            inline_code_length = None
+            continue
+        if ATX_HEADING_RE.match(content) or THEMATIC_BREAK_RE.match(content):
+            inline_code_length = None
 
-        visible_line, inline_code_length = _strip_inline_code(line, inline_code_length)
+        visible_line, inline_code_length = _strip_inline_code(
+            line, inline_code_length, lines, line_index
+        )
         for match in INLINE_LINK_RE.finditer(visible_line):
             links.append((source, line_number, match.group(1), context))
         reference = REFERENCE_LINK_RE.match(visible_line)
