@@ -3,7 +3,9 @@ import test from 'node:test';
 
 import {
   CRON_DEFAULT_EXPRESSION,
+  cronSchedulePatchForEdit,
   cronFieldValidity,
+  getGuidedCronExpression,
   isValidCronExpression,
   isValidCronField,
   normalizeCronFields,
@@ -11,6 +13,7 @@ import {
 } from './cron.ts';
 
 test('accepts the standard five-field expressions used by the cron editor', () => {
+  assert.equal(CRON_DEFAULT_EXPRESSION, '0 9 * * 1-5');
   assert.equal(isValidCronExpression('*/15 * * * *'), true);
   assert.equal(isValidCronExpression('0 9 * * 1-5'), true);
   assert.equal(isValidCronExpression('0 0 1 * *'), true);
@@ -40,5 +43,65 @@ test('reports field-level validity for the five editor inputs', () => {
 test('normalizes and parses editor fields without changing the API shape', () => {
   assert.equal(normalizeCronFields(['*/15', ' *', '* ', ' *', '1-5']), '*/15 * * * 1-5');
   assert.deepEqual(splitCronExpression('0 9 * * 1-5'), ['0', '9', '*', '*', '1-5']);
-  assert.deepEqual(splitCronExpression('0 9 * *'), CRON_DEFAULT_EXPRESSION.split(' '));
+  assert.equal(splitCronExpression('0 9 * *'), undefined);
+  assert.equal(splitCronExpression('0 0 9 * * 1-5'), undefined);
+  assert.equal(splitCronExpression('0 0 9 * * 1-5 2027'), undefined);
+});
+
+test('only valid five-field cron schedules use the guided editor', () => {
+  assert.equal(
+    getGuidedCronExpression({ kind: 'cron', expr: '0 9 * * 1-5' }),
+    '0 9 * * 1-5',
+  );
+  assert.equal(
+    getGuidedCronExpression({ kind: 'cron', expr: '0 0 9 * * 1-5' }),
+    undefined,
+  );
+  assert.equal(
+    getGuidedCronExpression({ kind: 'cron', expr: '0 0 9 * * 1-5 2027' }),
+    undefined,
+  );
+  assert.equal(
+    getGuidedCronExpression({ kind: 'cron', expr: '60 9 * * 1-5' }),
+    undefined,
+  );
+  assert.equal(
+    getGuidedCronExpression({ kind: 'at', at: '2030-01-01T00:00:00Z' }),
+    undefined,
+  );
+  assert.equal(
+    getGuidedCronExpression({ kind: 'every', every_ms: 3_600_000 }),
+    undefined,
+  );
+});
+
+test('partial edits omit schedule unless the existing schedule is guided cron', () => {
+  assert.deepEqual(
+    cronSchedulePatchForEdit(
+      { kind: 'cron', expr: '0 9 * * 1-5' },
+      '*/15 * * * *',
+    ),
+    { schedule: '*/15 * * * *' },
+  );
+  assert.deepEqual(
+    cronSchedulePatchForEdit(
+      { kind: 'cron', expr: '0 0 9 * * 1-5' },
+      '0 9 * * 1-5',
+    ),
+    {},
+  );
+  assert.deepEqual(
+    cronSchedulePatchForEdit(
+      { kind: 'at', at: '2030-01-01T00:00:00Z' },
+      '0 9 * * 1-5',
+    ),
+    {},
+  );
+  assert.deepEqual(
+    cronSchedulePatchForEdit(
+      { kind: 'every', every_ms: 3_600_000 },
+      '0 9 * * 1-5',
+    ),
+    {},
+  );
 });

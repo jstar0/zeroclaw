@@ -10,6 +10,11 @@ export const CRON_FIELD_DEFINITIONS = [
 
 const CRON_FIELD_COUNT = CRON_FIELD_DEFINITIONS.length;
 
+export type CronScheduleValue =
+  | { kind: 'cron'; expr: string }
+  | { kind: 'at'; at: string }
+  | { kind: 'every'; every_ms: number };
+
 function isInRange(value: string, min: number, max: number): boolean {
   if (!/^\d+$/.test(value)) return false;
   const number = Number(value);
@@ -66,15 +71,34 @@ export function isValidCronExpression(expression: string): boolean {
   return fields.length === CRON_FIELD_COUNT && cronFieldValidity(fields).every(Boolean);
 }
 
+/** Return the normalized value only for schedules the guided editor can preserve. */
+export function getGuidedCronExpression(
+  schedule: CronScheduleValue,
+): string | undefined {
+  if (schedule.kind !== 'cron' || !isValidCronExpression(schedule.expr)) {
+    return undefined;
+  }
+
+  const fields = splitCronExpression(schedule.expr);
+  return fields ? normalizeCronFields(fields) : undefined;
+}
+
+/** Omit unsupported schedule kinds from partial edits so unrelated fields stay safe. */
+export function cronSchedulePatchForEdit(
+  schedule: CronScheduleValue,
+  expression: string,
+): { schedule?: string } {
+  if (getGuidedCronExpression(schedule) === undefined) return {};
+  return { schedule: expression.trim() };
+}
+
 /** Normalize an expression into the single-space form sent to the API. */
 export function normalizeCronFields(fields: readonly string[]): string {
   return fields.map((field) => field.trim().replace(/\s+/g, '')).join(' ');
 }
 
-/** Parse an external expression, falling back to the issue's valid default. */
-export function splitCronExpression(expression: string): string[] {
+/** Split only five-field expressions; unsupported schedules must remain untouched. */
+export function splitCronExpression(expression: string): string[] | undefined {
   const fields = expression.trim().split(/\s+/);
-  return fields.length === CRON_FIELD_COUNT && fields.every(Boolean)
-    ? fields
-    : CRON_DEFAULT_EXPRESSION.split(' ');
+  return fields.length === CRON_FIELD_COUNT && fields.every(Boolean) ? fields : undefined;
 }
