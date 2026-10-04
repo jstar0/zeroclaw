@@ -4,7 +4,6 @@ import { useEffect, useMemo, useState } from 'react';
 
 import { t } from '@/lib/i18n';
 import {
-  CRON_DEFAULT_EXPRESSION,
   CRON_FIELD_DEFINITIONS,
   cronFieldValidity,
   normalizeCronFields,
@@ -22,7 +21,9 @@ export default function CronFieldsInput({
   onChange,
   onValidityChange,
 }: CronFieldsInputProps) {
-  const [fields, setFields] = useState(() => splitCronExpression(value));
+  const [fields, setFields] = useState(
+    () => splitCronExpression(value) ?? CRON_FIELD_DEFINITIONS.map(() => ''),
+  );
   const fieldValidity = useMemo(() => cronFieldValidity(fields), [fields]);
   const isValid = fieldValidity.every(Boolean);
   const expression = normalizeCronFields(fields);
@@ -37,6 +38,7 @@ export default function CronFieldsInput({
 
   useEffect(() => {
     const nextFields = splitCronExpression(value);
+    if (!nextFields) return;
     setFields((current) =>
       current.join(' ') === nextFields.join(' ') ? current : nextFields,
     );
@@ -104,7 +106,7 @@ export default function CronFieldsInput({
             {t('cron.schedule_assembled')}
           </span>
           <code className="rounded bg-pc-code px-2 py-1 text-sm text-pc-text-secondary">
-            {expression || CRON_DEFAULT_EXPRESSION}
+            {expression}
           </code>
         </div>
         <div className="mt-3 flex items-start gap-2 text-sm">
